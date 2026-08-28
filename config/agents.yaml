@@ -1,0 +1,61 @@
+# Phase-3 agent configuration.
+# Toggle individual agents, scoring weights, and decision thresholds here.
+orchestrator:
+  schema_version: "1.0"
+  max_decisions_per_session: 1000
+  cooldown_seconds: 60        # minimum interval between decisions per symbol
+  loop_interval_seconds: 300  # poll interval when running in --loop mode
+
+# Master switches: disable a specialized agent to fall back to its deterministic
+# default observation. Useful during incremental rollout.
+agents:
+  regime:
+    enabled: true
+  direction:
+    enabled: true
+  volatility:
+    enabled: true
+  options_structure:
+    enabled: true
+  portfolio:
+    enabled: true
+  risk:
+    enabled: true
+  supervisor:
+    enabled: true
+  execution:
+    enabled: true
+
+# LLM provider (pluggable). 'mock' returns deterministic structured output and
+# is the default for paper/dry-run. Switch to 'openai' or 'anthropic' for live
+# reasoning - both require the corresponding API key in the environment.
+llm:
+  provider: mock
+  model: mock-1
+  temperature: 0.0
+  max_tokens: 1024
+  timeout_s: 30
+
+# Decision thresholds (doc section 15). A decision is fired only when an ML
+# score crosses these, or a portfolio/regime event crosses the matching gate.
+thresholds:
+  direction_prob_min: 0.55          # require P(up) > this to be a 'long bias'
+  iv_rv_gap_min: 0.05               # |predicted_iv - predicted_rv| required
+  candidate_min_score: 0.30         # candidates below this are dropped
+  confidence_min: 0.50              # supervisor drops low-confidence
+  portfolio_review_pct: 0.50        # 50% of max exposure triggers review
+  no_trade_if_disagreement: true    # agents in conflict => NO_TRADE default
+
+# Candidate scoring weights (doc section 11). Sum does not need to be 1.0 -
+# they enter the formula directly. Tune via walk-forward backtesting only.
+scoring:
+  weights:
+    direction_edge: 0.30
+    volatility_edge: 0.20
+    option_expected_return: 0.25
+    probability_profit: 0.20
+    gnn_confirmation: 0.10
+    spread_penalty: 0.10
+    liquidity_penalty: 0.05
+    portfolio_risk_penalty: 0.15
+  candidate_set_size: 5             # Options Structure Agent returns top-N

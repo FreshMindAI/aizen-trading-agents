@@ -1,0 +1,16 @@
+# Top-level runtime settings. Imports the three sub-configs.
+project:
+  name: aizen-trading
+  phase: 3
+  decision_journal_table: decision_journal
+
+paths:
+  config_dir: config
+  models_dir: models
+  data_dir: data
+  reports_dir: reports
+
+logging:
+  level: INFO
+  format: "%(asctime)s %(levelname)-7s %(name)s :: %(message)s"
+  json: false

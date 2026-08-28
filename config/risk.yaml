@@ -1,0 +1,26 @@
+# Hard risk limits. Risk Agent is deterministic and authoritative: NO LLM call
+# can override a REJECT. OrderIntent is reduced to approved_quantity, never
+# inflated.
+risk:
+  # Per-trade limits
+  max_leg_quantity: 10
+  max_order_notional_usd: 2000.0
+  max_loss_per_trade_usd: 300.0
+
+  # Portfolio-level limits
+  max_open_positions: 6
+  max_concentration_per_underlying: 0.40   # 40% of gross notional
+  max_gross_exposure_usd: 8000.0
+  max_net_delta_per_underlying: 50.0       # shares-equivalent
+  max_net_vega_per_underlying: 100.0
+
+  # Spread / liquidity
+  max_bid_ask_spread_pct: 0.15
+  min_open_interest: 50
+  min_option_volume: 10
+
+  # Universe / instrument filters
+  allowed_underlyings: [SPY, QQQ, AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, AMD]
+  allowed_expiries_dte_min: 7
+  allowed_expiries_dte_max: 60
+  require_liquid_underlying: true

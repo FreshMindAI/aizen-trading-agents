@@ -1,0 +1,115 @@
+"""Decision Supervisor.
+
+Resolves conflicts among agent observations, picks one candidate (or
+NO_TRADE), and constructs the OrderIntent. The LLM is asked to EXPLAIN the
+pick; the math (best-score / no-trade-on-disagreement) is deterministic.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ...config import get_settings
+from ..protocol import (
+    AgentObservation,
+    DecisionState,
+    Leg,
+    MessageType,
+    OrderIntent,
+    Side,
+    StrategyProposal,
+)
+from ._common import _llm_call, _to_message
+
+
+def build_node(llm, config: dict[str, Any], risk_limits):
+    role = (
+        "Resolve conflicts between agent observations. Pick the highest-score "
+        "candidate whose signals are not contradicted by the regime/direction/"
+        "volatility agents, OR return NO_TRADE."
+    )
+    thresh = config.get("thresholds", {})
+    no_trade_if_disagreement = bool(thresh.get("no_trade_if_disagreement", True))
+    confidence_min = float(thresh.get("confidence_min", 0.50))
+
+    def node(state: DecisionState) -> dict[str, Any]:
+        candidates = state.candidate_strategies
+        observations = state.agent_observations
+
+        if not candidates:
+            obs = _supervisor_obs(llm, observations, candidates, "NO_TRADE", "no candidates",
+                                  0.1, role, state)
+            return _as_update(state, obs, None)
+
+        top = candidates[0]
+        if _has_conflict(observations, top) and no_trade_if_disagreement:
+            obs = _supervisor_obs(llm, observations, candidates, "NO_TRADE",
+                                  "agent disagreement", 0.2, role, state)
+            return _as_update(state, obs, None)
+
+        if top.confidence < confidence_min:
+            obs = _supervisor_obs(llm, observations, candidates, "NO_TRADE",
+                                  "below confidence_min", 0.2, role, state)
+            return _as_update(state, obs, None)
+
+        intent = _build_intent(top)
+        obs = _supervisor_obs(llm, observations, candidates, "PROCEED",
+                              f"selected {top.strategy_id}", top.confidence, role, state)
+        return _as_update(state, obs, intent, top)
+
+    return node
+
+
+def _has_conflict(observations: list[AgentObservation], top: StrategyProposal) -> bool:
+    """Heuristic conflict detector: regime=danger + direction opposes top's
+    underlying bias => conflict. Keeps it simple, fully deterministic."""
+    for obs in observations:
+        if obs.signal.get("label_heuristic") in ("high_volatility", "crisis"):
+            return True
+    return False
+
+
+def _build_intent(proposal: StrategyProposal) -> OrderIntent:
+    settings = get_settings()
+    qty = max(1, proposal.legs[0].quantity)
+    return OrderIntent(
+        strategy_id=proposal.strategy_id,
+        underlying=proposal.underlying,
+        legs=[Leg(**leg.model_dump()) for leg in proposal.legs],
+        quantity=qty,
+        limit_price=proposal.legs[0].limit_price,
+        time_in_force="day",
+        account_mode="PAPER" if settings.run_mode != "live" else "LIVE",
+    )
+
+
+def _supervisor_obs(llm, observations, candidates, action: str, reason: str,
+                    confidence: float, role: str, state: DecisionState) -> AgentObservation:
+    payload = {
+        "action": action,
+        "reason": reason,
+        "observations": [o.model_dump(mode="json") for o in observations],
+        "candidates": [c.model_dump(mode="json") for c in candidates[:5]],
+    }
+    obs = _llm_call(llm, "supervisor", role, payload, AgentObservation)
+    return obs.model_copy(update={
+        "message_type": MessageType.SUPERVISOR_DECISION,
+        "confidence": max(obs.confidence, confidence),
+        "signal": {"action": action, "reason": reason, **obs.signal},
+    })
+
+
+def _as_update(state: DecisionState, obs: AgentObservation,
+               intent: OrderIntent | None,
+               selected: StrategyProposal | None = None) -> dict[str, Any]:
+    msg = _to_message(obs, state.decision_id, "supervisor", "execution")
+    update: dict[str, Any] = {
+        "agent_observations": [obs],
+        "agent_messages": [msg],
+        "final_action": "PROCEED" if intent else "NO_TRADE",
+    }
+    if intent is not None:
+        update["order_intent"] = intent
+    if selected is not None:
+        update["selected_strategy"] = selected
+    return update

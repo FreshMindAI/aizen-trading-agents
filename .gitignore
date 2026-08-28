@@ -1,0 +1,38 @@
+# Secrets - never commit
+.env
+.env.*
+!.env.example
+.env.txt
+
+# Local data
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# Models / notebooks
+models/*.pkl
+models/*.meta.json
+models/*.json
+notebooks/.ipynb_checkpoints/
+
+# Spec / planning docs (kept locally; never committed)
+*.docx
+specs/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Reports
+reports/
+*.log

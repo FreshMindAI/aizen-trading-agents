@@ -1,0 +1,21 @@
+# Alpaca endpoint configuration.
+# Hosts/keys are sourced from environment (.env) - this file holds the SHAPE only.
+run_mode: paper         # paper | dry-run | live  (live requires explicit override)
+broker: ALPACA
+account_mode: PAPER
+
+# Two distinct host groups (spec section 4): data vs trading.
+data:
+  base_url: https://data.alpaca.markets
+  feed: iex
+  adjustment: split
+  rate_limit_per_min: 190
+  max_retries: 5
+  timeout_s: [5, 30]
+
+trading:
+  # paper-api host is correct for PAPER accounts; for live override at runtime.
+  base_url: https://paper-api.alpaca.markets
+  rate_limit_per_min: 200
+  max_retries: 3
+  timeout_s: [5, 15]
