@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 import requests
@@ -43,26 +44,41 @@ class AnthropicProvider(LLMProvider):
 
     def __init__(self, base_url: str | None = None, default_model: str | None = None,
                  api_key: str | None = None, timeout_s: int = 60,
-                 max_retries: int = 2) -> None:
+                 max_retries: int = 2, auth_token: str | None = None,
+                 extra_headers: dict[str, str] | None = None) -> None:
+        # ANTHROPIC_AUTH_TOKEN (GMI / proxies) overrides ANTHROPIC_API_KEY when
+        # set. When auth_token is present we send `Authorization: Bearer ...`
+        # instead of `x-api-key: ...` because GMI expects bearer auth.
+        env_token = os.getenv("ANTHROPIC_AUTH_TOKEN")
+        self.auth_token = auth_token or env_token
         super().__init__(base_url=base_url, default_model=default_model,
                          api_key=api_key, timeout_s=timeout_s)
-        if not self.api_key:
+        if not (self.api_key or self.auth_token):
             raise LLMError(
-                "ANTHROPIC_API_KEY is not set. Export it (or pass api_key=...) before "
-                "constructing AnthropicProvider."
+                "Neither ANTHROPIC_API_KEY nor ANTHROPIC_AUTH_TOKEN is set. Export one "
+                "(or pass api_key=.../auth_token=...) before constructing AnthropicProvider."
             )
         self.max_retries = max_retries
         self._session = requests.Session()
-        self._session.headers.update({
-            "x-api-key": self.api_key,
+        headers = {
             "anthropic-version": ANTHROPIC_API_VERSION,
             "content-type": "application/json",
-        })
+        }
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        else:
+            headers["x-api-key"] = self.api_key
+        if extra_headers:
+            headers.update(extra_headers)
+        self._session.headers.update(headers)
 
     # ---- public ---------------------------------------------------------
     def complete(self, request: LLMRequest) -> LLMResponse:
         body = self._build_body(request)
-        url = f"{self.base_url}/v1/messages"
+        # Path is configurable so GMI / LiteLLM proxies with non-standard
+        # routes (e.g. /anthropic/v1/messages) can be used.
+        path = os.getenv("ANTHROPIC_MESSAGES_PATH", "/v1/messages")
+        url = f"{self.base_url}{path}"
         last_err: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
