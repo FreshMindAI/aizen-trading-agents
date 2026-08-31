@@ -9,6 +9,11 @@ Mirrors how the Claude Agent SDK / Claude Code wire requests:
 Translates the response into the canonical LLMResponse. Supports tool use
 (text + tool_calls in one turn), which the orchestrator can route back into
 the agent loop.
+
+Retry behaviour is delegated to ``LLMProvider._call_with_retry`` so the
+exact same bounded exponential-backoff schedule is shared with
+``OpenAIProvider``. The provider's only responsibility here is request
+shape + response parsing.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from .base import (
     LLMResponse,
     ToolSpec,
 )
+from .telemetry import LLMCallTelemetry
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +50,7 @@ class AnthropicProvider(LLMProvider):
 
     def __init__(self, base_url: str | None = None, default_model: str | None = None,
                  api_key: str | None = None, timeout_s: int = 60,
-                 max_retries: int = 2, auth_token: str | None = None,
+                 max_retries: int | None = None, auth_token: str | None = None,
                  extra_headers: dict[str, str] | None = None) -> None:
         # ANTHROPIC_AUTH_TOKEN (GMI / proxies) overrides ANTHROPIC_API_KEY when
         # set. When auth_token is present we send `Authorization: Bearer ...`
@@ -58,7 +64,16 @@ class AnthropicProvider(LLMProvider):
                 "Neither ANTHROPIC_API_KEY nor ANTHROPIC_AUTH_TOKEN is set. Export one "
                 "(or pass api_key=.../auth_token=...) before constructing AnthropicProvider."
             )
-        self.max_retries = max_retries
+        # ``max_retries`` is the legacy kwarg name - we keep it for callers
+        # that still pass it but it now controls the *total* attempt count
+        # via ``_call_with_retry`` (1 initial + max_retries retries == max_retries+1
+        # total). Default falls back to ``_default_max_attempts()`` (env override,
+        # else 4). We accept max_retries=2 (old default) as 3 total attempts for
+        # backward compatibility.
+        if max_retries is not None:
+            self._max_attempts_override = max(1, int(max_retries) + 1)
+        else:
+            self._max_attempts_override = None
         self._session = requests.Session()
         headers = {
             "anthropic-version": ANTHROPIC_API_VERSION,
@@ -79,37 +94,27 @@ class AnthropicProvider(LLMProvider):
         # routes (e.g. /anthropic/v1/messages) can be used.
         path = os.getenv("ANTHROPIC_MESSAGES_PATH", "/v1/messages")
         url = f"{self.base_url}{path}"
-        last_err: Exception | None = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                resp = self._session.post(
-                    url, json=body, timeout=self.timeout_s,
-                )
-            except requests.RequestException as exc:
-                last_err = exc
-                if attempt < self.max_retries:
-                    self._backoff(attempt)
-                    continue
-                raise LLMError(f"anthropic transport error: {exc}") from exc
-
-            if resp.status_code >= 500 and attempt < self.max_retries:
-                last_err = RuntimeError(f"http {resp.status_code}")
-                self._backoff(attempt)
-                continue
-            if resp.status_code in (408, 429) and attempt < self.max_retries:
-                last_err = RuntimeError(f"http {resp.status_code}")
-                self._backoff(attempt, retry_after=resp.headers.get("retry-after"))
-                continue
-            if resp.status_code >= 400:
-                # Don't retry client errors - the request itself is bad.
-                raise LLMError(
-                    f"anthropic {resp.status_code}: {resp.text[:500]}"
-                )
-            try:
-                return self._parse(resp.json())
-            except (ValueError, KeyError) as exc:
-                raise LLMError(f"anthropic returned unparseable body: {exc}") from exc
-        raise LLMError(f"anthropic giving up after retries: {last_err}")
+        model = request.model or self.default_model
+        telemetry = LLMCallTelemetry(
+            provider=self.PROVIDER_NAME, model=model,
+        )
+        # Always publish a telemetry record, even on the error path. We use
+        # a try/finally so the orchestrator can read ``last_call`` whether
+        # the call succeeded or raised.
+        try:
+            payload = self._call_with_retry(
+                telemetry=telemetry,
+                perform=lambda: self._session.post(url, json=body, timeout=self.timeout_s),
+                parse=lambda r: r.json(),
+                max_attempts=self._max_attempts_override,
+                retry_after_for=self._retry_after_for,
+            )
+        except Exception:
+            # Telemetry already finalized by the helper; just publish.
+            self.last_call = telemetry
+            raise
+        self.last_call = telemetry
+        return self._parse(payload)
 
     # ---- internal -------------------------------------------------------
     def _build_body(self, req: LLMRequest) -> dict[str, Any]:
@@ -169,11 +174,20 @@ class AnthropicProvider(LLMProvider):
         )
 
     def _backoff(self, attempt: int, retry_after: str | None = None) -> None:
-        import time
-        if retry_after:
-            try:
-                time.sleep(min(float(retry_after), 30.0))
-                return
-            except ValueError:
-                pass
-        time.sleep(min(0.5 * (2 ** attempt), 10.0))
+        # Kept for backwards compatibility with any external callers that
+        # imported the private method. New retry logic lives in the
+        # base class's _call_with_retry; this is a no-op shim.
+        return
+
+    @staticmethod
+    def _retry_after_for(resp: "requests.Response") -> float | None:
+        """Parse the Retry-After header (seconds). Returns None if absent
+        or unparseable. Mirrors how Claude Code reads the Anthropic
+        Messages API rate-limit response."""
+        ra = resp.headers.get("retry-after")
+        if not ra:
+            return None
+        try:
+            return float(ra)
+        except (TypeError, ValueError):
+            return None

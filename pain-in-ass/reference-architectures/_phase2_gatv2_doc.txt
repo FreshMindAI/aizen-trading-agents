@@ -1,0 +1,267 @@
+Phase 2 — GATv2 + Dynamic Financial Topology
+
+Topology construction, graph attention, hybrid ML/GNN evaluation and path to adaptive topology
+
+1. Purpose
+
+Phase 2 adds relational intelligence to the Phase-1 XGBoost baseline. The goal is not to force a GNN to beat XGBoost on every metric. The goal is to determine whether relationships among underlyings, option contracts, strikes, expiries, volatility and related assets contain incremental predictive information that a tabular model does not naturally capture.
+
+2. Key architectural correction
+
+A GNN does not automatically receive a meaningful financial topology from a flat feature table. We must construct an initial topology from financial relationships. The GNN then learns how information should propagate across that topology. A graph-attention model can additionally learn which neighboring relationships deserve more weight.
+
+Financial data     |Topology Builder     |Initial financial graph     |GATv2     |Learned attention / graph embeddings     |Prediction / downstream agents
+
+3. Phase-2 architecture
+
+SQLite / Parquet      |      +-- underlying bars      +-- option contracts      +-- option bars      +-- option quotes      +-- correlations / derived features      |      vTopology Builder      |      vGraph Snapshot nodes + edges + node features + edge features      |      vGATv2 Encoder      |      +--> attention weights      +--> graph/node embeddings      |      vPrediction Heads      +--> Direction      +--> Future RV      +--> Option Opportunity      |      vCompare with XGBoost      |      vHybrid XGBoost + GATv2 (if justified)
+
+4. What is the topology?
+
+The topology is the structure defining which financial entities are connected. Nodes represent entities and edges represent meaningful financial relationships. Edge features describe relationship type or strength.
+
+4.1 Node types
+
+UNDERLYING — stocks/ETFs.
+
+OPTION — individual call/put contracts.
+
+EXPIRY — expiration-date nodes where useful.
+
+STRIKE — strike-level nodes where useful.
+
+MARKET_INDEX — broad market references.
+
+SECTOR / RELATED_ASSET — sector ETFs or correlated assets.
+
+Later: VOLATILITY_FACTOR and NEWS_EVENT.
+
+4.2 Initial edge types
+
+OPTION → UNDERLYING: contract belongs to underlying.
+
+OPTION → OPTION: same expiry.
+
+OPTION → OPTION: nearby strike.
+
+OPTION → OPTION: same strike across call/put or expiry.
+
+OPTION → OPTION: neighboring expiry.
+
+UNDERLYING → RELATED_ASSET: empirical correlation.
+
+UNDERLYING → SECTOR: sector membership.
+
+UNDERLYING → MARKET_INDEX: market relationship.
+
+5. Edge features
+
+edge_typecorrelationstrike_distanceexpiry_distancemoneyness_distanceiv_differencereturn_correlationliquidity_similaritytimestamp
+
+The exact edge-feature set must be validated experimentally. Every relationship must be timestamp-safe.
+
+6. How topology is generated
+
+SQLite  |  +--> option metadata  +--> timestamp-aligned prices/quotes  +--> valid historical IV/Greeks  +--> underlying returns  +--> correlations  |  vTopology Builder  |  +--> create nodes  +--> create typed edges  +--> calculate edge attributes  +--> remove invalid/stale relationships  |  vVersioned Graph Snapshot
+
+The first topology builder is deterministic. Each graph snapshot receives a topology_version, timestamp and construction configuration for reproducibility.
+
+7. Example options topology
+
+NVDA                 /    |    \              180C   190C   200C                |      |      |              Sep20   Sep20   Sep20                |      |      |              180P   190P   200P                \      |     /                 related strikes                      |                  QQQ / XLK
+
+Illustrative only. Production topology is generated from the actual option universe and timestamp-aligned relationships.
+
+8. Why Graph Attention?
+
+A standard message-passing GNN aggregates neighbor information. Graph Attention learns a weight for each neighbor. GATv2 is the preferred experiment because its attention formulation is more flexible than the original GAT formulation.
+
+Neighbor A ---- attention 0.10 --Neighbor B ---- attention 0.65 -----> Target nodeNeighbor C ---- attention 0.25 --/
+
+Attention is learned influence weighting, not proof of causality. High attention must not be described as a causal relationship.
+
+9. Proposed GATv2 architecture
+
+Input graph   |Node feature projection   |GATv2 layer   |GATv2 layer   |Residual / normalization   |Node / graph embedding   |Prediction heads   +---- Direction   +---- Future RV   +---- Option Opportunity
+
+Use multi-head attention initially.
+
+Normalize node and edge features.
+
+Use dropout/weight decay to control overfitting.
+
+Use timestamp-aware train/validation/test splits.
+
+Store attention diagnostics for selected validation examples.
+
+10. XGBoost vs GNN experiment
+
+Because the current GNN is not outperforming XGBoost, the next step is a controlled ablation rather than blindly increasing model complexity.
+
+A: Features -> XGBoostB: Same features + current graph -> GNNC: Same features + meaningful financial topology -> GATv2D: XGBoost features + GATv2 embedding -> Hybrid
+
+All experiments must use identical timestamp splits and equivalent target definitions.
+
+11. Why GATv2 may still lose to XGBoost
+
+The graph may add little information beyond tabular features.
+
+Edges may be arbitrary or weakly defined.
+
+The graph may be too small.
+
+The target may be primarily local/tabular.
+
+Node/edge normalization may be poor.
+
+The GNN may overfit or oversmooth.
+
+Graph construction may have leakage or timestamp misalignment.
+
+Accuracy may not reflect economic value.
+
+12. Where GNN should add value
+
+Relational modeling is expected to be more useful for option-surface and contract-selection problems than for a simple underlying direction target.
+
+Direction:Underlying features -> XGBoost may be strongestFuture RV:Underlying + market regime -> XGBoost may be strongestOption Opportunity:Option surface + related contracts + underlying                    -> GATv2 may add relational value
+
+13. Hybrid architecture
+
+Features                     |             +-------+-------+             |               |          XGBoost          GATv2             |               |        tabular score    graph embedding             |               |             +-------+-------+                     |                  fusion                     |                 prediction
+
+Keep the hybrid only if it improves out-of-sample or trading metrics. Complexity alone is not a reason to use it.
+
+14. Evaluation metrics
+
+Accuracy where classification is appropriate.
+
+ROC-AUC and PR-AUC.
+
+Probability calibration/Brier score.
+
+RMSE/MAE for future RV.
+
+Expected return and probability-profit for option opportunity.
+
+Sharpe, Sortino, maximum drawdown and profit factor in Phase 4.
+
+Latency and memory.
+
+Performance by market regime.
+
+15. Regime-specific evaluation
+
+XGBoost     GATv2      HybridNormal             ?           ?           ?Bull               ?           ?           ?Bear               ?           ?           ?High volatility    ?           ?           ?Event regime       ?           ?           ?
+
+A GNN does not need to win globally. It may provide incremental edge specifically in complex option-surface or high-volatility regimes.
+
+16. Static to dynamic topology
+
+Static financial relationships        |        vInitial topology        |       GATv2        |Attention weights        |Relationship importance        |Phase-6 topology controller        |Reweight / activate / deactivatevalidated relationships
+
+Do not allow the Phase-2 model to freely create arbitrary edges in the first experiment. That makes evaluation and interpretation difficult.
+
+17. Phase-6 adaptive topology path
+
+Market regime    |GNN / attention state    |Topology Controller    |+---+----------+----------+|              |          |Normal       High Vol    Eventgraph         graph       graph|              |          |agents         agents     agents
+
+Maintain validated topology versions.
+
+Use attention and historical performance as signals, not absolute truth.
+
+Shadow-test new configurations.
+
+Require minimum sample sizes.
+
+Keep rollback to a known-good topology.
+
+Never bypass deterministic risk controls.
+
+18. Data requirements
+
+Phase 2 uses the Phase-1 data layer; no separate database is required.
+
+Underlying historical bars.
+
+Option contract metadata.
+
+Historical option bars.
+
+Historical option quotes strongly recommended.
+
+Timestamp-safe historical IV/Greeks where available or reconstructable.
+
+Underlying correlations and related-asset relationships.
+
+Phase-1 model outputs.
+
+Current/live option snapshots must remain separate from historical training data to prevent leakage.
+
+19. Implementation plan
+
+Define node and edge schema.
+
+Implement Topology Builder from SQLite.
+
+Generate deterministic graph snapshots.
+
+Add topology versioning.
+
+Create graph dataset and timestamp-aware splits.
+
+Implement baseline GCN/GraphSAGE if needed.
+
+Implement GATv2 with PyTorch Geometric.
+
+Train on the same targets as Phase 1.
+
+Run XGBoost vs GNN vs GATv2 ablation.
+
+Test hybrid XGBoost + GATv2.
+
+Evaluate by target and market regime.
+
+Persist graph embeddings and attention diagnostics.
+
+Pass validated GNN outputs to Phase 3 agents.
+
+20. Phase-2 deliverables
+
+Topology specification.
+
+Deterministic topology builder.
+
+Versioned graph snapshots.
+
+GATv2 training/inference pipeline.
+
+Attention diagnostics.
+
+XGBoost vs GATv2 vs hybrid benchmark.
+
+Out-of-sample evaluation report.
+
+Graph embedding interface for Phase 3.
+
+Foundation for Phase-6 adaptive topology.
+
+21. Overall architecture
+
+PHASE 1XGBoost"What is likely to happen?"       |PHASE 2Topology Builder"Who is related to whom?"       |GATv2"Which relationships matter?"       |Graph embedding"What does the financial network represent?"       |PHASE 3Multi-Agent System"What should we do?"       |PHASE 4+Backtest -> Paper Trading -> Adaptation -> RL
+
+22. Scientific principle
+
+Do not optimize the GNN merely to beat XGBoost on one accuracy number. First prove that the graph contains incremental information. If XGBoost remains better for direction while GATv2 improves option-surface decisions or risk-adjusted trading performance, a specialized hybrid system may be the correct architecture.
+
+23. Recommended decision
+
+Proceed with GATv2 as the next Phase-2 experiment, but improve the topology builder at the same time. The highest-priority work is meaningful, timestamp-safe financial edges—not simply making the GNN deeper. The existing Alpaca underlying and option data can generate the first topology.
+
+24. References
+
+PyTorch Geometric — https://pytorch-geometric.readthedocs.io/
+
+Graph Attention Networks — https://arxiv.org/abs/1710.10903
+
+GATv2 — https://arxiv.org/abs/2105.14491

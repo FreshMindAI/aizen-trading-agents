@@ -24,14 +24,21 @@ edits.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Literal, Type, TypeVar
+from typing import Any, Callable, Iterable, Literal, Type, TypeVar
 
+import requests
 from pydantic import BaseModel
 
+from .telemetry import LLMCallAttempt, LLMCallTelemetry, LLMTransportError
+
 T = TypeVar("T", bound=BaseModel)
+logger = logging.getLogger(__name__)
 
 # Default Anthropic Messages API host. Override with ANTHROPIC_BASE_URL when
 # proxying (LiteLLM, internal gateways, etc.).
@@ -103,6 +110,11 @@ class LLMProvider(ABC):
         self.default_model = default_model or self._env_model() or self.DEFAULT_MODEL
         self.api_key = api_key or self._env_api_key()
         self.timeout_s = timeout_s
+        # Telemetry slot for the most recent LLM call. Subclasses that go
+        # over the wire (AnthropicProvider, OpenAIProvider) populate this
+        # on every call. MockProvider leaves it None - the orchestrator
+        # detects that and skips emitting an llm_call step in the trace.
+        self.last_call: LLMCallTelemetry | None = None
 
     # ---- env hooks subclasses override ----------------------------------
     DEFAULT_BASE_URL: str = ""
@@ -110,6 +122,196 @@ class LLMProvider(ABC):
     ENV_BASE_URL: str = ""
     ENV_MODEL: str = ""
     ENV_API_KEY: str = ""
+
+    # ---- shared retry helper -------------------------------------------
+    @staticmethod
+    def _default_max_attempts() -> int:
+        """Bounded retry count. Default 4 (= 1 initial + 3 retries). Honoured
+        as long as a provider has not overridden the kwarg explicitly. Ops
+        can bump via AIZEN_LLM_MAX_ATTEMPTS=5 etc."""
+        raw = os.getenv("AIZEN_LLM_MAX_ATTEMPTS", "4").strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            return 4
+        return max(1, min(n, 10))  # clamp to [1, 10] to bound test waits
+
+    def _call_with_retry(
+        cls_or_self,
+        *,
+        telemetry: LLMCallTelemetry,
+        perform: Callable[[], "requests.Response | None",
+        ],
+        parse: Callable[["requests.Response"], Any],
+        max_attempts: int | None = None,
+        base_delay_s: float = 0.5,
+        max_delay_s: float = 30.0,
+        retry_after_for: Callable[["requests.Response"], float | None] | None = None,
+    ) -> Any:
+        """Bounded exponential backoff wrapper for HTTP LLM calls.
+
+        Args:
+            telemetry: populated on every attempt; stashed on self.last_call
+                by the caller before this helper returns.
+            perform: callable that issues ONE HTTP request. Returns the
+                `requests.Response` (any status code) or raises a
+                `requests.RequestException` on transport failure. Returning
+                `None` is treated like a transport error and retried.
+            parse: callable that takes a 2xx response and returns the parsed
+                payload. If it raises, the error is treated as a permanent
+                client error (no retry) and re-raised as LLMError.
+            max_attempts: total attempts including the first. Default = env
+                override or 4. Clamped to >= 1.
+            base_delay_s: initial sleep; doubles each retry up to max_delay_s.
+            max_delay_s: cap on the exponential schedule (Retry-After is
+                honored above this, so providers can still ask for longer).
+
+        Returns the parsed payload on success. Raises `LLMError` on a
+        permanent client error (4xx other than 408/429, parse failure) or
+        on exhaustion of `max_attempts` for transport / 5xx / 408 / 429.
+        """
+        if max_attempts is None:
+            # ``cls_or_self`` may be a class (when called as
+            # ``LLMProvider._call_with_retry(...)``) or an instance
+            # (when called as ``self._call_with_retry(...)``). Either
+            # way ``_default_max_attempts`` is a staticmethod so we
+            # can reach it via the class.
+            cls = cls_or_self if isinstance(cls_or_self, type) else type(cls_or_self)
+            max_attempts = cls._default_max_attempts()
+        max_attempts = max(1, max_attempts)
+
+        # Per-attempt helper: run, classify, sleep, record telemetry.
+        def _attempt(idx: int, last_resp_holder: list) -> Any:
+            # The sleep that PRECEDED this attempt. Attempt 1 has no sleep.
+            # The retry loop mutates `pending_sleep_s` on the just-recorded
+            # attempt after raising LLMTransportError; here we read it.
+            slept = 0.0
+            if idx > 1 and telemetry.attempts:
+                slept = telemetry.attempts[-1].slept_before_s
+            try:
+                resp = perform()
+            except requests.RequestException as exc:
+                telemetry.record_attempt(
+                    idx, status=None,
+                    error=f"{type(exc).__name__}: {exc}",
+                    slept_before_s=slept,
+                )
+                raise LLMTransportError(
+                    f"{telemetry.provider} transport error on attempt {idx}: {exc}"
+                ) from exc
+            if resp is None:
+                telemetry.record_attempt(
+                    idx, status=None,
+                    error="perform() returned None",
+                    slept_before_s=slept,
+                )
+                raise LLMTransportError(
+                    f"{telemetry.provider} perform() returned None on attempt {idx}"
+                )
+
+            status = int(getattr(resp, "status_code", 0) or 0)
+            # Stash the last response so the retry loop can read headers
+            # (Retry-After) to drive the next sleep.
+            last_resp_holder[0] = resp
+
+            if 500 <= status < 600:
+                telemetry.record_attempt(
+                    idx, status=status,
+                    error=("" if status == 0 else f"http {status}"),
+                    slept_before_s=slept,
+                )
+                raise LLMTransportError(
+                    f"{telemetry.provider} {status} on attempt {idx}"
+                )
+            if status in (408, 429):
+                telemetry.record_attempt(
+                    idx, status=status,
+                    error=f"http {status}",
+                    slept_before_s=slept,
+                )
+                raise LLMTransportError(
+                    f"{telemetry.provider} {status} on attempt {idx}"
+                )
+            if 400 <= status < 500:
+                # Permanent client error: parse the body for context, then
+                # record the attempt and raise LLMError. Do NOT retry.
+                body = ""
+                try:
+                    body = (getattr(resp, "text", "") or "")[:300]
+                except Exception:  # pragma: no cover - defensive
+                    body = "<body unreadable>"
+                telemetry.record_attempt(
+                    idx, status=status,
+                    error=f"http {status}: {body}",
+                    slept_before_s=slept,
+                )
+                raise LLMError(
+                    f"{telemetry.provider} client error {status}: {body}"
+                )
+            # 2xx (or 3xx) - hand off to the parser.
+            try:
+                payload = parse(resp)
+            except (ValueError, KeyError, json.JSONDecodeError) as exc:
+                # Malformed body is a permanent error for this attempt.
+                telemetry.record_attempt(
+                    idx, status=status,
+                    error=f"parse error: {type(exc).__name__}: {exc}",
+                    slept_before_s=slept,
+                )
+                raise LLMError(
+                    f"{telemetry.provider} unparseable response: {exc}"
+                ) from exc
+            telemetry.record_attempt(
+                idx, status=status, error=None, slept_before_s=slept,
+            )
+            return payload
+
+        # Main loop.
+        last_exc: Exception | None = None
+        last_resp_holder: list = [None]  # mutable single-cell container
+        for attempt_idx in range(1, max_attempts + 1):
+            try:
+                result = _attempt(attempt_idx, last_resp_holder)
+            except LLMTransportError as exc:
+                last_exc = exc
+                if attempt_idx >= max_attempts:
+                    break
+                # Compute sleep for the *next* attempt and stash it on
+                # the just-recorded attempt so the trace knows what
+                # backoff was used. The next attempt reads this back via
+                # `telemetry.attempts[-1].slept_before_s`.
+                delay = min(base_delay_s * (2 ** (attempt_idx - 1)), max_delay_s)
+                # Retry-After header can override the schedule (capped at
+                # max_delay_s). Provider passes a parser via retry_after_for.
+                last_resp = last_resp_holder[0]
+                if retry_after_for is not None and last_resp is not None:
+                    try:
+                        ra = retry_after_for(last_resp)
+                    except Exception:  # pragma: no cover - defensive
+                        ra = None
+                    if ra is not None and ra > 0:
+                        delay = min(float(ra), max_delay_s)
+                if telemetry.attempts:
+                    telemetry.attempts[-1].slept_before_s = delay
+                time.sleep(delay)
+                last_resp_holder[0] = None
+                continue
+            except LLMError:
+                # Permanent client error / parse error. The caller is
+                # expected to have finalized or will finalize telemetry
+                # before re-raising; we just bubble up.
+                raise
+            # Success.
+            telemetry.finalize(succeeded=True)
+            return result
+
+        # Exhausted retries. Finalize telemetry and re-raise.
+        telemetry.finalize(succeeded=False)
+        raise LLMError(
+            f"{telemetry.provider} giving up after {max_attempts} attempts: "
+            f"{type(last_exc).__name__ if last_exc else 'unknown'}: "
+            f"{last_exc if last_exc else ''}"
+        ) from last_exc
 
     def _env_base_url(self) -> str | None:
         return os.getenv(self.ENV_BASE_URL) if self.ENV_BASE_URL else None
@@ -225,11 +427,14 @@ __all__ = [
     "ANTHROPIC_API_VERSION",
     "OPENAI_DEFAULT_BASE_URL",
     "OPENAI_DEFAULT_MODEL",
+    "LLMCallAttempt",
+    "LLMCallTelemetry",
     "LLMError",
     "LLMMessage",
     "LLMProvider",
     "LLMRequest",
     "LLMResponse",
+    "LLMTransportError",
     "ToolSpec",
     "get_provider",
 ]

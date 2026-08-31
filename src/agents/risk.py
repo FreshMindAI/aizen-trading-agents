@@ -39,6 +39,17 @@ class RiskLimits:
     allowed_expiries_dte_min: int = 7
     allowed_expiries_dte_max: int = 60
     require_liquid_underlying: bool = True
+    # Equity-specific limits (hackathon parallel path). Equity legs
+    # bypass option premium/theta concerns but introduce Pattern Day
+    # Trader risk and full notional exposure. Defaults sized for a
+    # 1-week paper account with cash (no leverage).
+    max_equity_notional_per_symbol: float = 1500.0
+    max_equity_notional_total: float = 5000.0
+    min_equity_direction_probability: float = 0.55
+    # When both option and equity candidates clear the score gate, the
+    # equity one is preferred by this score-margin. Negative = prefer
+    # options. Set to 0 to make it a tie (option wins as default).
+    equity_preferred_when_score_margin: float = 0.0
 
     @classmethod
     def from_yaml(cls, raw: Mapping[str, Any]) -> "RiskLimits":
@@ -73,16 +84,105 @@ class RiskLimits:
             require_liquid_underlying=bool(
                 raw.get("require_liquid_underlying", cls.require_liquid_underlying)
             ),
+            max_equity_notional_per_symbol=float(
+                raw.get("max_equity_notional_per_symbol", cls.max_equity_notional_per_symbol)
+            ),
+            max_equity_notional_total=float(
+                raw.get("max_equity_notional_total", cls.max_equity_notional_total)
+            ),
+            min_equity_direction_probability=float(
+                raw.get("min_equity_direction_probability", cls.min_equity_direction_probability)
+            ),
+            equity_preferred_when_score_margin=float(
+                raw.get("equity_preferred_when_score_margin", cls.equity_preferred_when_score_margin)
+            ),
+        )
+
+    @classmethod
+    def scaled_from_capital(cls, capital_usd: float) -> "RiskLimits":
+        """Build a :class:`RiskLimits` whose dollar caps are a fixed % of
+        the account's capital.
+
+        Allocation policy (round-trip, cash account, no leverage):
+          * 2 % per trade  → ``max_order_notional_usd``
+          * 5 % per symbol → ``max_equity_notional_per_symbol`` and per-leg
+            max-notional proxy
+          * 10 % gross equity (no leverage, no margin)
+          * 40 % gross (mix of equity + options) → ``max_gross_exposure_usd``
+          * 5 % per-trade max loss → ``max_loss_per_trade_usd``
+          * 50 % max concentration per underlying (within gross)
+          * 6 concurrent open positions (1-week hackathon, not a 6-month fund)
+          * 200-share max leg (caps illiquid mega-caps to ~$200k notional
+            — well above the per-symbol cap, so the per-symbol cap binds
+            first)
+          * 50-share max net delta per underlying (50 * $200 = $10k delta
+            exposure max — ~10% of the $100k account)
+          * 200 vega per underlying (options side)
+
+        The percentages are hard-coded on purpose: they encode the
+        "1-week hackathon paper account with $100k cash" policy. A real
+        prop shop would re-derive them from a Kelly / vol-target model
+        in a separate ``RiskPolicy`` class. The function is deterministic
+        and pure so the same capital value produces the same limits
+        across cycles.
+        """
+        if capital_usd <= 0:
+            raise ValueError(f"capital_usd must be > 0; got {capital_usd}")
+        return cls(
+            max_leg_quantity=200,
+            max_order_notional_usd=round(capital_usd * 0.02, 2),
+            max_loss_per_trade_usd=round(capital_usd * 0.05, 2),
+            max_open_positions=6,
+            max_concentration_per_underlying=0.50,
+            max_gross_exposure_usd=round(capital_usd * 0.40, 2),
+            max_net_delta_per_underlying=50.0,
+            max_net_vega_per_underlying=200.0,
+            max_bid_ask_spread_pct=0.05,         # tighter on a bigger book
+            min_open_interest=100,                # need deeper OI for size
+            min_option_volume=50,
+            allowed_underlyings=(),
+            allowed_expiries_dte_min=5,
+            allowed_expiries_dte_max=10,
+            require_liquid_underlying=True,
+            # Equity-specific (5% of capital per name, 10% of capital gross)
+            max_equity_notional_per_symbol=round(capital_usd * 0.05, 2),
+            max_equity_notional_total=round(capital_usd * 0.10, 2),
+            min_equity_direction_probability=0.55,
+            equity_preferred_when_score_margin=0.0,
         )
 
 
 def _notional_for_intent(intent: OrderIntent) -> float:
-    """Conservative notional estimate: sum of quantity * (limit_price or 0)."""
+    """Conservative notional estimate: sum of quantity * price.
+
+    Option contracts carry a 100x multiplier (one contract = 100 shares);
+    equity legs do not. The notional for an equity leg is therefore
+    ``quantity * price`` while an option leg is ``quantity * price * 100``.
+    """
     total = 0.0
     for leg in intent.legs:
         price = leg.limit_price or 0.0
-        total += leg.quantity * price * 100.0  # option multiplier
+        if leg.asset_class == "equity":
+            total += leg.quantity * price
+        else:
+            total += leg.quantity * price * 100.0  # option multiplier
     return total
+
+
+def _notional_for_intent_by_asset_class(intent: OrderIntent) -> tuple[float, float]:
+    """Split the notional into (equity_notional, option_notional).
+
+    Used by the equity-specific risk checks (per-symbol and total caps).
+    """
+    equity_notional = 0.0
+    option_notional = 0.0
+    for leg in intent.legs:
+        price = leg.limit_price or 0.0
+        if leg.asset_class == "equity":
+            equity_notional += leg.quantity * price
+        else:
+            option_notional += leg.quantity * price * 100.0
+    return equity_notional, option_notional
 
 
 def evaluate(intent: OrderIntent, snapshot: MarketSnapshot | None,
@@ -144,9 +244,56 @@ def evaluate(intent: OrderIntent, snapshot: MarketSnapshot | None,
             detail=f"${notional:.0f} > ${limits.max_order_notional_usd:.0f}",
         ))
 
+    # --- equity-specific notional caps (parallel options+stocks path) ---
+    equity_notional, _opt_notional = _notional_for_intent_by_asset_class(intent)
+    if equity_notional > 0:
+        # Per-symbol cap: a single equity leg cannot exceed
+        # max_equity_notional_per_symbol (default $1.5k).
+        for leg in intent.legs:
+            if leg.asset_class != "equity":
+                continue
+            leg_notional = leg.quantity * (leg.limit_price or 0.0)
+            if leg_notional > limits.max_equity_notional_per_symbol:
+                # Cap the leg quantity to the per-symbol notional limit.
+                max_qty = max(1, int(limits.max_equity_notional_per_symbol / max(leg.limit_price or 1.0, 0.01)))
+                if max_qty < leg.quantity:
+                    approved_qty = min(approved_qty, max_qty)
+                    reasons.append(
+                        f"equity leg {leg.contract_symbol} notional "
+                        f"${leg_notional:.0f} exceeds per-symbol cap "
+                        f"${limits.max_equity_notional_per_symbol:.0f}, "
+                        f"scaled qty to {max_qty}"
+                    )
+                    checks.append(RiskCheck(
+                        name="equity_per_symbol_notional", passed=False,
+                        detail=f"{leg.contract_symbol} ${leg_notional:.0f} > "
+                               f"${limits.max_equity_notional_per_symbol:.0f}",
+                    ))
+        # Total equity cap: across all symbols in the intent, equity
+        # notional cannot exceed max_equity_notional_total (default $5k).
+        if equity_notional > limits.max_equity_notional_total:
+            scale = limits.max_equity_notional_total / max(equity_notional, 1.0)
+            new_qty = max(1, int(intent.quantity * scale))
+            if new_qty < intent.quantity:
+                approved_qty = min(approved_qty, new_qty)
+                reasons.append(
+                    f"total equity notional ${equity_notional:.0f} exceeds "
+                    f"${limits.max_equity_notional_total:.0f}, scaled qty to {new_qty}"
+                )
+            checks.append(RiskCheck(
+                name="equity_total_notional", passed=False,
+                detail=f"${equity_notional:.0f} > ${limits.max_equity_notional_total:.0f}",
+            ))
+
     # --- per-trade max loss (synthetic, no Greeks yet) ---
+    def _leg_max_loss(leg) -> float:
+        if leg.asset_class == "equity":
+            # Equity: max loss bounded by full notional (price -> 0).
+            return float(leg.limit_price or 0.0) * float(leg.quantity)
+        # Option: premium paid * 100 multiplier * qty (the price paid).
+        return float(leg.limit_price or 5.0) * 100.0 * float(leg.quantity)
     leg_loss = sum(
-        (leg.limit_price or 5.0) * 100.0 * leg.quantity
+        _leg_max_loss(leg)
         for leg in intent.legs if leg.side == Side.BUY
     )
     if leg_loss > limits.max_loss_per_trade_usd:

@@ -15,6 +15,13 @@ agents:
     enabled: true
   volatility:
     enabled: true
+  research:
+    # Spec 003: news-driven GATv2 feature. Default OFF per the failure-analysis
+    # close-out checklist row 4. The walk-forward ablation report in
+    # models/ablation_option_opportunity.json is the gate; flip to true only
+    # after the report's `promote_default.promote == true`. Env var override:
+    # AIZEN_RESEARCH_ENABLED=true.
+    enabled: false
   options_structure:
     enabled: true
   portfolio:
@@ -50,6 +57,12 @@ thresholds:
   confidence_min: 0.50              # supervisor drops low-confidence
   portfolio_review_pct: 0.50        # 50% of max exposure triggers review
   no_trade_if_disagreement: true    # agents in conflict => NO_TRADE default
+  # Hackathon sizing (1-week window: 2026-08-28 -> 2026-09-04): the XGBoost
+  # model is trained on a 4-bar forward horizon (~1h), so holding an option
+  # 25-60 days to expiry bleeds the premium to theta before the signal can
+  # play out. Tighten DTE to fit the trade window.
+  dte_min: 5
+  dte_max: 10                       # 1-week hackathon: 5-10 DTE only
 
 # Candidate scoring weights (doc section 11). Sum does not need to be 1.0 -
 # they enter the formula directly. Tune via walk-forward backtesting only.
@@ -60,6 +73,7 @@ scoring:
     option_expected_return: 0.25
     probability_profit: 0.20
     gnn_confirmation: 0.10
+    news_sentiment: 0.0             # spec 003: 0.0 by default; 0.10 if ablation promotes
     spread_penalty: 0.10
     liquidity_penalty: 0.05
     portfolio_risk_penalty: 0.15

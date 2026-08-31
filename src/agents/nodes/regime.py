@@ -19,7 +19,7 @@ from ..protocol import (
 from ._common import AgentResult, _llm_call, _to_message
 
 
-def build_node(llm, config: dict[str, Any], risk_limits):
+def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
     role = "Classify the market regime and explain with evidence."
 
     def node(state: DecisionState) -> dict[str, Any]:

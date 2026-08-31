@@ -105,13 +105,36 @@ def _xgb(params, kind: str):
     return XGBClassifier(**params) if kind == "clf" else XGBRegressor(**params)
 
 
-def _fit_with_early_stop(model, kind, X_tr, y_tr, X_val, y_val):
-    """XGBoost early-stops on the validation slice; linear models ignore it."""
+def _fit_with_early_stop(model, kind, X_tr, y_tr, X_val, y_val, sample_weight=None):
+    """XGBoost early-stops on the validation slice; linear models ignore it.
+
+    ``sample_weight`` (optional, 1-D) applies a per-row weight — used by the
+    ``--balance class_weights`` mode to re-balance classes at the loss layer
+    without changing XGBoost's internal ``scale_pos_weight`` (which only
+    affects the binary 0/1 case and is set via the param dict).
+    """
     if isinstance(model, (XGBClassifier, XGBRegressor)):
-        model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+        kwargs = {"eval_set": [(X_val, y_val)], "verbose": False}
+        if sample_weight is not None:
+            kwargs["sample_weight"] = sample_weight
+        model.fit(X_tr, y_tr, **kwargs)
     else:
-        model.fit(X_tr, y_tr)
+        if sample_weight is not None:
+            model.fit(X_tr, y_tr, sample_weight=sample_weight)
+        else:
+            model.fit(X_tr, y_tr)
     return model
+
+
+def _class_weights_from_y(y: np.ndarray) -> np.ndarray:
+    """Per-row weights that make each class contribute equally to the loss.
+
+    w_i = 1 / freq(y_i). Used by ``--balance class_weights`` (Option C).
+    """
+    y = np.asarray(y)
+    classes, counts = np.unique(y, return_counts=True)
+    inv = {c: len(y) / (len(classes) * n) for c, n in zip(classes, counts)}
+    return np.array([inv[v] for v in y], dtype=float)
 
 
 def _predict(model, X, kind: str) -> np.ndarray:
@@ -175,12 +198,32 @@ def run_task(task: str, horizon: int, conn, args) -> None:
             "test": mx.majority_baseline_metrics(y_te),
         }
 
+        # Class-balancing (Options B + C):
+        #   --balance none              : default XGBoost behavior (current)
+        #   --balance scale_pos_weight  : set XGBoost param, retrain (Option B)
+        #   --balance class_weights     : pass per-row sample_weight (Option C)
+        scale_pos_weight = None
+        sample_weight = None
+        if getattr(args, "balance", "none") == "scale_pos_weight":
+            pos = float(y_tr.sum()); neg = float(len(y_tr) - y_tr.sum())
+            if pos > 0 and neg > 0:
+                scale_pos_weight = neg / pos
+                print(f"  scale_pos_weight = neg/pos = {scale_pos_weight:.3f}")
+        elif getattr(args, "balance", "none") == "class_weights":
+            sample_weight = _class_weights_from_y(y_tr)
+            print(f"  class_weights: per-class count = "
+                  f"{dict(zip(*np.unique(y_tr, return_counts=True)))}")
+
+        xgb_clf_params = dict(XGB_CLF_PARAMS)
+        if scale_pos_weight is not None:
+            xgb_clf_params["scale_pos_weight"] = scale_pos_weight
+
         models = {}
         lr = ScaledLinear(LogisticRegression(**LOGREG_PARAMS))
         lr.fit(X_tr, y_tr)
         models["logreg"] = lr
-        xgb = _xgb(XGB_CLF_PARAMS, "clf")
-        _fit_with_early_stop(xgb, "clf", X_tr, y_tr, X_va, y_va)
+        xgb = _xgb(xgb_clf_params, "clf")
+        _fit_with_early_stop(xgb, "clf", X_tr, y_tr, X_va, y_va, sample_weight=sample_weight)
         models["xgb"] = xgb
 
         for name, model in models.items():
@@ -391,6 +434,11 @@ def main(argv=None) -> int:
                    help="option round-trip cost (default: v_params.option_cost_roundtrip)")
     p.add_argument("--walk-forward", action="store_true")
     p.add_argument("--folds", type=int, default=4)
+    p.add_argument("--balance", choices=["none", "scale_pos_weight", "class_weights"],
+                   default="none",
+                   help="Class balancing for clf heads. "
+                        "'scale_pos_weight' (B) sets XGBoost's param. "
+                        "'class_weights' (C) passes per-row sample_weight=1/freq.")
     args = p.parse_args(argv)
     if args.dataset is None:
         args.dataset = "underlying" if args.task in ("direction", "rv") else "option"

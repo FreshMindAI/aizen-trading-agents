@@ -1,0 +1,164 @@
+Phase 2 — GNN Trading Model
+End-to-end design for a $0-cost research prototype
+1. Objective
+Extend the Phase 1 baseline into a Graph Neural Network that learns from relationships between financial entities. The first GNN should use a fixed graph. Dynamic graph/topology learning is deliberately postponed until the fixed-GNN benchmark is validated.
+2. Why a GNN?
+A conventional model sees an asset's features as a vector. A GNN can additionally aggregate information from neighboring nodes. For example, NVIDIA can receive information from suppliers, competitors, customers, sector peers, or a market index.
+Graph:
+TSMC ---- NVIDIA ---- Microsoft
+            |
+           AMD
+
+Nodes = entities
+Edges = relationships
+Node features = market/fundamental features
+Edge features = relationship type/strength, if available
+3. Recommended first graph
+Start with a small universe: 10–30 liquid US equities plus a benchmark node.
+Use daily bars initially if intraday graph construction becomes too large.
+Use explicit, defensible edges: same-sector/industry, known supplier/customer relationship, ETF membership, or strong rolling-correlation edges.
+Do not create edges from the entire dataset using future information. Any correlation-based edge must be calculated only from data available before the prediction timestamp.
+4. Graph data representation
+Node matrix X:
+[number_of_nodes, number_of_features]
+
+Example:
+NVIDIA  -> [return_1d, return_5d, volatility, RSI, volume_change, ...]
+AMD     -> [...]
+TSMC    -> [...]
+MSFT    -> [...]
+
+Edge list:
+[(NVIDIA, TSMC),
+ (NVIDIA, AMD),
+ (NVIDIA, MSFT)]
+5. GNN architecture
+class StockGNN(torch.nn.Module):
+    def __init__(self, n_features):
+        super().__init__()
+        self.conv1 = GCNConv(n_features, 32)
+        self.conv2 = GCNConv(32, 16)
+        self.head = torch.nn.Linear(16, 1)
+
+    def forward(self, x, edge_index):
+        x = torch.relu(self.conv1(x, edge_index))
+        x = torch.relu(self.conv2(x, edge_index))
+        return self.head(x).squeeze(-1)
+The GNN receives both X (node features) and edge_index (graph structure). Each convolution layer aggregates information from neighboring nodes before applying learned transformations.
+6. Training target
+Keep the Phase 1 target exactly the same initially. This makes the experiment scientifically clean: only the representation/model class changes.
+7. Temporal graph snapshots
+For each timestamp t:
+
+1. Build node features using information <= t.
+2. Build the graph using information <= t.
+3. Predict target for t -> future horizon.
+4. Move to t+1.
+
+Conceptually:
+
+G_t, X_t -> GNN -> P(asset_i rises in future horizon)
+8. Fixed GNN before dynamic GNN
+Do not let the first GNN change its own topology. First prove that a fixed, well-defined graph improves over Phase 1. If it does not, dynamic topology will mostly add complexity and overfitting.
+9. Comparison experiment
+Same:
+- assets
+- target
+- time periods
+- transaction costs
+- thresholds
+- evaluation metrics
+
+Compare:
+Logistic Regression
+XGBoost
+MLP
+Fixed GNN
+10. Dynamic topology — later extension
+Once the fixed GNN is stable, introduce a topology controller. It can propose actions such as ADD_EDGE, REMOVE_EDGE, ACTIVATE_AGENT, or DEACTIVATE_AGENT. Candidate topologies are evaluated using walk-forward backtesting and complexity penalties.
+Current topology
+      |
+Topology Controller
+      |
+      +--> add edge
+      +--> remove edge
+      +--> activate component
+      +--> deactivate component
+      |
+Candidate topology
+      |
+Walk-forward validation
+      |
+Risk + performance score
+      |
+Accept / reject
+11. Recommended dynamic objective
+score =
+    risk_adjusted_return
+    - transaction_cost_penalty
+    - max_drawdown_penalty
+    - topology_complexity_penalty
+This prevents the system from adding unnecessary nodes/edges merely because they improve in-sample performance.
+12. Free compute and deployment
+A small GNN can train on CPU. If a GPU is useful, use free notebook/education compute when available, but keep the code CPU-compatible. For a demo endpoint, Hugging Face Spaces currently offers free CPU Basic hardware and also has a ZeroGPU option with shared GPU access; availability and quotas can change. A public demo is different from a reliable always-on trading service, so do not assume free hosting provides guaranteed uptime.
+13. Suggested repository structure
+phase2-gnn/
+  data/
+    nodes/
+    edges/
+    snapshots/
+  src/
+    build_graph.py
+    node_features.py
+    edge_features.py
+    dataset.py
+    gnn.py
+    train.py
+    evaluate.py
+    backtest.py
+  models/
+  reports/
+  requirements.txt
+  README.md
+14. Free-first architecture
+Alpaca Historical Data
+        |
+        v
+Local/Colab preprocessing
+        |
+        +---- Phase 1 tabular models
+        |
+        +---- Phase 2 graph snapshots
+                       |
+                       v
+                    PyTorch
+                       |
+                PyTorch Geometric
+                       |
+                       v
+                 GNN model
+                       |
+                       v
+                Backtester
+                       |
+                       v
+               Paper Trading
+                       |
+                       v
+              Optional free demo
+15. Ready-made GNN vs training
+There are reusable GNN architectures such as GCN, GraphSAGE, GAT and temporal graph methods. Reuse the architecture implementation; train the model parameters on your financial graph. A generic pretrained GNN is not automatically a useful stock predictor because its node definitions, edge semantics, target, and market regime may differ.
+16. Phase 2 acceptance criteria
+Graph construction is reproducible and leakage-free.
+Every node has a timestamp-aligned feature vector.
+Every edge has a documented reason for existing.
+Fixed GNN trains and produces predictions.
+The same backtester evaluates Phase 1 and Phase 2.
+GNN performance is reported against all Phase 1 baselines.
+Only after this benchmark is stable should dynamic topology be introduced.
+17. Sources
+Alpaca Historical API: https://docs.alpaca.markets/us/docs/historical-api
+Alpaca Historical Stock Bars: https://docs.alpaca.markets/us/reference/stockbarsingle-1
+PyTorch Geometric documentation: https://pytorch-geometric.readthedocs.io/
+Hugging Face Spaces overview: https://huggingface.co/docs/hub/en/spaces-overview
+Hugging Face ZeroGPU: https://huggingface.co/docs/hub/main/spaces-zerogpu

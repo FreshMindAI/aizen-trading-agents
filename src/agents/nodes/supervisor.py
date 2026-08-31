@@ -22,7 +22,7 @@ from ..protocol import (
 from ._common import _llm_call, _to_message
 
 
-def build_node(llm, config: dict[str, Any], risk_limits):
+def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
     role = (
         "Resolve conflicts between agent observations. Pick the highest-score "
         "candidate whose signals are not contradicted by the regime/direction/"

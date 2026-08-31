@@ -1,0 +1,140 @@
+# Phase-2 GNN configuration.
+# This file is loaded by src.config._load_yaml_bundle and exposed via
+# src.config.get_yaml("gnn"). The Phase 2 module never reads this file
+# directly; it always goes through the settings layer so the same code
+# runs against paper, dry-run, and live environments.
+#
+# Constitution principle V (Config over code) covers the architecture,
+# splits, hyperparameters, and topology version. The universe and
+# feature_names are mirrored from Phase 1's v_features_underlying_v2
+# and the existing universe constant - they live here for one-stop
+# reproducibility.
+
+# ---------------------------------------------------------------------------
+# Versioning
+# ---------------------------------------------------------------------------
+schema_version: "1.0"
+topology_version: "fixed-1"   # reserved for a future dynamic controller
+
+# ---------------------------------------------------------------------------
+# Universe (10 underlyings + SPY benchmark). Mirrors src.gnn.constants.
+# ---------------------------------------------------------------------------
+universe:
+  - SPY
+  - QQQ
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMZN
+  - META
+  - GOOGL
+  - TSLA
+  - AMD
+
+# ---------------------------------------------------------------------------
+# Model registry. The default is the GCNConv(->32->16->1) from the Phase 2
+# spec. The other two are placeholders so the architecture can be swapped
+# without touching the dataset or training loop.
+# ---------------------------------------------------------------------------
+model:
+  architecture: "gcn-32-16-1"
+  registry:
+    gcn-32-16-1:
+      type: "GCNConv"
+      hidden_dims: [32, 16]
+      out_dim: 1
+    gat-32-16-1:
+      type: "GATConv"
+      hidden_dims: [32, 16]
+      out_dim: 1
+    sage-32-16-1:
+      type: "SAGEConv"
+      hidden_dims: [32, 16]
+      out_dim: 1
+
+# ---------------------------------------------------------------------------
+# Feature columns. MUST match v_features_underlying_v2 exactly.
+# ---------------------------------------------------------------------------
+features:
+  # 14 columns. Order matters: tensor columns are read in this order.
+  columns:
+    - return_1
+    - return_4
+    - return_16
+    - volatility_16
+    - rsi_14
+    - macd_pct
+    - hl_range
+    - atr_pct_14
+    - ma_dist_20
+    - ma_dist_50
+    - volume_ratio_20
+    - vwap_distance
+    - spy_ret_1
+    - qqq_ret_past_16
+
+# ---------------------------------------------------------------------------
+# Edge builder.
+# ---------------------------------------------------------------------------
+edges:
+  reasons:
+    - sector
+    - supplier
+    - customer
+    - etf_membership
+    - correlation
+    # Spec 003: news-driven option-graph edge types. The first four are
+    # structural; these two are news-driven and re-wire daily based on
+    # the news_snapshot table. The trainer gates on `news_cooccurrence`
+    # + `news_sentiment_correlation` per ablation row `used_news`.
+    - news_cooccurrence
+    - news_sentiment_correlation
+  # Correlation edges: only emit when |corr| > threshold over a rolling window.
+  correlation:
+    threshold: 0.5
+    window_bars: 64
+  # Spec 003: news-edge thresholds.
+  news:
+    cooccurrence:
+      min_articles: 2              # at least 2 distinct articles in 24h
+      weight: "log(1 + count)"     # spec FR-005
+    sentiment_correlation:
+      min_abs_rho: 0.5             # 5-day rolling |Pearson| threshold
+      window_days: 5
+      weight: "abs(rho)"           # spec FR-006
+    lookback_hours: 24             # for the co-occurrence count
+
+# ---------------------------------------------------------------------------
+# Snapshot policy. Daily aligned, ISO-8601 timestamps in UTC.
+# ---------------------------------------------------------------------------
+snapshot:
+  cadence: "1D"               # daily
+  topology_version: "fixed-1"
+
+# ---------------------------------------------------------------------------
+# Training protocol. Chronological TRAIN -> VAL -> TEST; newest held out.
+# Walk-forward re-runs the same protocol across the same window.
+# ---------------------------------------------------------------------------
+training:
+  horizon_bars: 16            # same as Phase 1 direction_h16
+  flat_band: 0.0025           # +/- 0.25% flat band; matches Phase 1 target_class
+  epochs: 50
+  batch_size: 1               # one snapshot per step (graphs are 11 nodes)
+  learning_rate: 0.005
+  weight_decay: 0.0005
+  early_stopping:
+    enabled: true
+    metric: "val_roc_auc"
+    patience: 10
+  seeds:
+    torch: 1337
+    numpy: 1337
+    python_hash: "1337"
+
+# ---------------------------------------------------------------------------
+# Artifacts. Saved under models/ (gitignored).
+# ---------------------------------------------------------------------------
+artifacts:
+  directory: "models"
+  prefix: "gnn"               # gnn-<date>-<n>.pt
+  report_path: "models/report_phase2_gnn.json"

@@ -84,7 +84,11 @@ def test_openai_provider_init():
 
 
 def test_anthropic_provider_init_fails_without_key(monkeypatch):
+    # Provider accepts either ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN
+    # (GMI / proxies); both must be removed to test the "no credentials"
+    # failure path the test name promises.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     from src.agents.llm.anthropic_provider import AnthropicProvider
     with pytest.raises(LLMError):
         AnthropicProvider()
@@ -92,6 +96,7 @@ def test_anthropic_provider_init_fails_without_key(monkeypatch):
 
 def test_openai_provider_init_fails_without_key(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_ORG_ID", raising=False)
     from src.agents.llm.openai_provider import OpenAIProvider
     with pytest.raises(LLMError):
         OpenAIProvider()

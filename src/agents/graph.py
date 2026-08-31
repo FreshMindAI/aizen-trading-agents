@@ -105,24 +105,97 @@ class Orchestrator:
     """
 
     def __init__(self, conn: sqlite3.Connection | None = None,
-                 config: dict[str, Any] | None = None) -> None:
+                 config: dict[str, Any] | None = None,
+                 *, as_of: str | None = None) -> None:
         self.settings = get_settings()
         self.agents_cfg = get_yaml("agents")
-        self.risk_cfg = get_yaml("risk")
+        # get_yaml('risk') returns the wrapped bundle {'risk': {...}}; the
+        # risk engine expects the inner dict, so unwrap explicitly. If
+        # the bundle is already flat (no 'risk' key), fall back to the
+        # whole mapping so old call-sites keep working.
+        _risk_bundle = get_yaml("risk")
+        self.risk_cfg = _risk_bundle.get("risk", _risk_bundle) if isinstance(_risk_bundle, dict) else _risk_bundle
         self.config = config or self.agents_cfg
-        self.risk_limits = RiskLimits.from_yaml(self.risk_cfg)
+        # Two ways to build the risk limits: (a) explicit dollar amounts
+        # in risk.yaml (legacy 1-week hackathon defaults), or (b) scaled
+        # from the account's capital (default for the multi-week paper
+        # account). The flag is opt-out: set ``scale_from_capital: false``
+        # in risk.yaml to pin the explicit dollar amounts.
+        _scale_from_capital = bool(self.risk_cfg.get("scale_from_capital", True))
+        if _scale_from_capital:
+            self.risk_limits = RiskLimits.scaled_from_capital(
+                float(getattr(self.settings, "capital_usd", 100_000.0))
+            )
+            logger.info(
+                "risk limits scaled from capital: $%.0f → "
+                "per-trade $%.0f, per-symbol $%.0f, gross $%.0f",
+                self.settings.capital_usd,
+                self.risk_limits.max_order_notional_usd,
+                self.risk_limits.max_equity_notional_per_symbol,
+                self.risk_limits.max_gross_exposure_usd,
+            )
+        else:
+            self.risk_limits = RiskLimits.from_yaml(self.risk_cfg)
+        # Point-in-time cut-off (ISO 8601). When set, every loader in
+        # the inference path filters on ``timestamp <= as_of`` so the
+        # snapshot is consistent with the cycle time. Used by the
+        # backtester (spec 003 / T046) and by hand-driven replays.
+        self.as_of = as_of
 
-        # Inference service reads from SQLite.
+        # Inference service reads from SQLite. The research_enabled flag
+        # is resolved from config/agents.yaml (agents.research.enabled) with
+        # the env var AIZEN_RESEARCH_ENABLED taking precedence. When True
+        # the snapshot is enriched with a ResearchOutput built from the
+        # news_snapshot table (spec 003 / T018).
+        #
+        # Topology version: resolved from env AIZEN_GNN_TOPOLOGY_VERSION
+        # (preferred, lets ops flip without a config edit) then from
+        # config/agents.yaml (orchestrator.topology_version) then
+        # "fixed-1". Values supported today:
+        #   "fixed-1"   : static sector/supplier/etf/correlation (default)
+        #   "dynamic-1" : fixed-1 PLUS rolling-correlation edges from
+        #                 src.gnn.dynamic_topology (recomputed at snapshot
+        #                 time from underlying_bars). The new edge
+        #                 reason "rolling_corr" is appended to the edge
+        #                 list; downstream agents see a topology_version
+        #                 of "dynamic-1" on the GNN output.
         self.conn = conn or connect()
+        import os as _os
+        _research_cfg = ((self.agents_cfg.get("agents") or {}).get("research") or {})
+        _env_research = _os.getenv("AIZEN_RESEARCH_ENABLED")
+        if _env_research is not None:
+            _research_enabled = _env_research.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            _research_enabled = bool(_research_cfg.get("enabled", False))
+        _topo_env = _os.getenv("AIZEN_GNN_TOPOLOGY_VERSION")
+        _topo_cfg = (self.agents_cfg.get("orchestrator") or {}).get("topology_version")
+        topology_version = _topo_env or _topo_cfg or "fixed-1"
+        if topology_version not in ("fixed-1", "dynamic-1"):
+            logger.warning(
+                "unknown topology_version=%r requested; falling back to 'fixed-1'. "
+                "Supported: 'fixed-1', 'dynamic-1'.",
+                topology_version,
+            )
+            topology_version = "fixed-1"
         self.inference = InferenceService(
-            self.conn, self.settings.universe, topology_version="stub-1",
+            self.conn, self.settings.universe, topology_version=topology_version,
+            research_enabled=_research_enabled,
+            as_of=self.as_of,
         )
 
-        # LLM provider.
+        # LLM provider. Resolution order (matches get_provider's contract):
+        #   1. env vars AIZEN_LLM_PROVIDER / LLM_PROVIDER (preferred - lets ops
+        #      flip providers without editing YAML)
+        #   2. config/agents.yaml `llm.provider`
+        #   3. 'mock' (default)
+        import os as _os
         llm_cfg = (self.agents_cfg.get("llm") or {})
+        env_provider = _os.getenv("AIZEN_LLM_PROVIDER") or _os.getenv("LLM_PROVIDER")
+        yaml_provider = llm_cfg.get("provider")
+        provider_name = (env_provider or yaml_provider or "mock")
         self.llm = get_provider(
-            llm_cfg.get("provider", "mock"),
-            model=llm_cfg.get("model"),
+            provider_name,
+            default_model=llm_cfg.get("model"),
             timeout_s=int(llm_cfg.get("timeout_s", 30)),
         )
 
@@ -133,6 +206,21 @@ class Orchestrator:
             run_mode=self.settings.run_mode,
         )
 
+        # Failure knowledge-graph writer. Persists every caught
+        # failure (cycle / agent / symbol) as a typed node with
+        # weighted edges so the GNN can treat the failure channel as
+        # a first-class signal. The writer is feature-flag-gated: it
+        # is a no-op when ``failure_kg_enabled`` is False. The default
+        # is True so failures don't get silently dropped again.
+        from .failure_kg import FailureKG
+        _fk_env = _os.getenv("AIZEN_FAILURE_KG_ENABLED")
+        if _fk_env is not None:
+            _fk_enabled = _fk_env.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            _fk_enabled = True
+        self.failure_kg_enabled = _fk_enabled
+        self.failure_kg = FailureKG(self.conn) if _fk_enabled else None
+
         # Lazy import so the package still works if langgraph isn't installed
         # (the system falls back to a sequential driver in that case).
         self._graph = self._build_graph()
@@ -141,28 +229,119 @@ class Orchestrator:
     # ---- public API ----------------------------------------------------
     def run_cycle(self) -> DecisionState:
         state = self._new_state()
-        if self._graph is not None:
-            final = self._graph.invoke(_to_state_dict(state))
-        else:
-            final = self._sequential(_to_state_dict(state))
+        cycle_error: str | None = None
+        cycle_exc: BaseException | None = None
+        try:
+            if self._graph is not None:
+                final = self._graph.invoke(_to_state_dict(state))
+            else:
+                final = self._sequential(_to_state_dict(state))
+        except Exception as exc:
+            # Cycle blew up (e.g. options market closed during execution).
+            # Persist a partial state + a trace so the failure is debuggable
+            # rather than a black-box exit. The trace captures what we had
+            # *before* the crash; the journal row records the failure mode.
+            cycle_error = f"{type(exc).__name__}: {exc}"
+            cycle_exc = exc
+            logger.exception("cycle failed: %s", cycle_error)
+            final = _to_state_dict(state)
+            # ``final_action`` is a Literal[PROCEED, NO_TRADE, REJECT, REDUCE];
+            # we can't add an ``ERROR`` value without breaking journal/contract
+            # invariants. Surface the failure via execution_result instead.
+            final["final_action"] = "NO_TRADE"
+            final["cycle_completed_at"] = _now_iso()
+            existing = final.get("execution_result") or {}
+            existing["error"] = cycle_error
+            existing["status"] = "ERROR"
+            final["execution_result"] = existing
         out = _from_state_dict(final)
         out.cycle_completed_at = out.cycle_completed_at or _now_iso()
+        # ---- failure knowledge graph (T169) ---------------------------
+        # Record the cycle-level failure as a node + connect to any
+        # per-symbol failures for the same decision_id. This block is
+        # best-effort: a FailureKG write failure must NOT cascade into
+        # a journal write failure (it is the most-recent layer).
+        if cycle_exc is not None and self.failure_kg is not None:
+            try:
+                self.failure_kg.record_cycle_failure(
+                    out.decision_id,
+                    out.cycle_started_at or _now_iso(),
+                    final_action=final.get("final_action"),
+                    exc=cycle_exc,
+                    metadata={"cycle_completed_at": out.cycle_completed_at},
+                )
+            except Exception as fk_exc:  # pragma: no cover - defensive
+                logger.warning("failure_kg cycle-failure write failed: %s", fk_exc)
         try:
             self.journal.upsert(out)
         except Exception as exc:  # pragma: no cover - never fail the cycle
             logger.exception("journal upsert failed: %s", exc)
+        # Per-cycle trace: write JSONL record per step (ML, GNN, topology,
+        # research, each agent, final). Lazy import so tests that don't
+        # touch trace.py don't pay the import cost. Always runs, even on
+        # ERROR cycles, so the on-disk record shows what the model saw
+        # before it crashed.
+        try:
+            from .trace import (
+                CycleTraceBuilder,
+                StepRecord,
+                build_agent_step,
+                build_final_step,
+                build_gnn_step,
+                build_llm_step,
+                build_ml_step,
+                build_research_step,
+                build_topology_step,
+            )
+            trace = CycleTraceBuilder(out.decision_id, out.cycle_started_at or _now_iso())
+            # ML step: re-centered gate = base_rate + 0.10 (mirrors direction node)
+            try:
+                from .nodes.strategy_selector import _BASE_RATE, _BASE_RATE_CUSHION
+                _thresh = min(0.95, _BASE_RATE + _BASE_RATE_CUSHION) if _BASE_RATE is not None else 0.55
+            except Exception:
+                _thresh = 0.55
+            trace.add(build_ml_step(threshold=_thresh, predictions=out.ml_predictions))
+            trace.add(build_gnn_step(out.gnn_output))
+            trace.add(build_topology_step(out.gnn_output, out.topology_version))
+            research_obj = out.market_snapshot.research if out.market_snapshot else None
+            trace.add(build_research_step(research_obj))
+            for obs in out.agent_observations:
+                trace.add(build_agent_step(obs))
+            # LLM call step: one record per cycle sourced from the provider's
+            # last_call telemetry. Skipped silently when the provider has no
+            # call to report (e.g. MockProvider, or a short-circuited cycle).
+            try:
+                llm_telemetry = getattr(self.llm, "last_call", None)
+                llm_step = build_llm_step(llm_telemetry)
+                if llm_step is not None:
+                    trace.add(llm_step)
+            except Exception as exc:  # pragma: no cover - never fail the cycle
+                logger.warning("llm_call trace build failed: %s", exc)
+            trace.add(build_final_step(out))
+            if cycle_error is not None:
+                # Append a final "error" step so the trace self-documents
+                # the failure mode without grepping the system log.
+                trace.add(StepRecord(step="error", success=False, reasons=[cycle_error]))
+            trace.write()
+        except Exception as exc:  # pragma: no cover - never fail the cycle
+            logger.exception("cycle trace write failed: %s", exc)
         return out
 
     # ---- internal ------------------------------------------------------
     def _new_state(self) -> DecisionState:
         snap = self.inference.build_snapshot()
         ml_preds = list(snap.underlyings)
-        return DecisionState(
+        state = DecisionState(
             market_snapshot=snap,
             ml_predictions=ml_preds,
             gnn_output=self.inference.gnn_output(),
             topology_version=self.inference.topology_version,
         )
+        # When ``as_of`` is set, stamp the cycle start to the cut-off
+        # so the journal row reflects the backtest time, not wall-clock.
+        if self.as_of is not None:
+            state.cycle_started_at = self.as_of
+        return state
 
     def _build_graph(self):
         try:
@@ -177,20 +356,35 @@ class Orchestrator:
             direction, execution, options_structure, portfolio,
             regime, risk as risk_node, supervisor, volatility,
         )
+        # Construct one in-process MCP server per orchestrator and hand
+        # each agent a per-agent SkillRegistry. The MCP server is
+        # constructed here (not in __init__) so the orchestrator
+        # already has settings + run_mode resolved.
+        from .mcp import AlpacaMCPServer
+        from .mcp.skills import build_skill_registry
+        mcp_server = AlpacaMCPServer(run_mode=self.settings.run_mode)
 
         g = sg_lib(_GraphState)
 
         nodes = {
-            "regime": regime.build_node(self.llm, self.agents_cfg, self.risk_limits),
-            "direction": direction.build_node(self.llm, self.agents_cfg, self.risk_limits),
-            "volatility": volatility.build_node(self.llm, self.agents_cfg, self.risk_limits),
-            "options_structure": options_structure.build_node(self.llm, self.agents_cfg, self.risk_limits),
-            "portfolio": portfolio.build_node(self.llm, self.agents_cfg, self.risk_limits),
-            "supervisor": supervisor.build_node(self.llm, self.agents_cfg, self.risk_limits),
-            "risk": risk_node.build_node(self.llm, self.agents_cfg, self.risk_limits),
+            "regime": regime.build_node(self.llm, self.agents_cfg, self.risk_limits,
+                                        skills=build_skill_registry("regime", mcp_server)),
+            "direction": direction.build_node(self.llm, self.agents_cfg, self.risk_limits,
+                                              skills=build_skill_registry("direction", mcp_server)),
+            "volatility": volatility.build_node(self.llm, self.agents_cfg, self.risk_limits,
+                                                skills=build_skill_registry("volatility", mcp_server)),
+            "options_structure": options_structure.build_node(self.llm, self.agents_cfg, self.risk_limits,
+                                                             skills=build_skill_registry("options_structure", mcp_server)),
+            "portfolio": portfolio.build_node(self.llm, self.agents_cfg, self.risk_limits,
+                                              skills=build_skill_registry("portfolio", mcp_server)),
+            "supervisor": supervisor.build_node(self.llm, self.agents_cfg, self.risk_limits,
+                                                skills=build_skill_registry("supervisor", mcp_server)),
+            "risk": risk_node.build_node(self.llm, self.agents_cfg, self.risk_limits,
+                                          skills=build_skill_registry("risk", mcp_server)),
             "execution": execution.build_node(self.llm,
                                               {**self.agents_cfg, "run_mode": self.settings.run_mode},
-                                              self.risk_limits),
+                                              self.risk_limits,
+                                              skills=build_skill_registry("execution", mcp_server)),
         }
         for name, fn in nodes.items():
             g.add_node(name, fn)

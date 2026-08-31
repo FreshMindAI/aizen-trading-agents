@@ -17,7 +17,7 @@ from ..protocol import (
 from ._common import AgentResult, _llm_call, _to_message
 
 
-def build_node(llm, config: dict[str, Any], risk_limits):
+def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
     role = (
         "Summarize the current portfolio: positions, concentration, exposure, "
         "and any concentration risks relative to the risk limits."

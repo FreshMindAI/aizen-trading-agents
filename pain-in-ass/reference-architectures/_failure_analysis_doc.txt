@@ -1,0 +1,337 @@
+Autonomous Multi-Agent Trading System
+
+Alpaca AI Trading Agents Hackathon — Project Summary & Failure Analysis
+
+Prepared ahead of Monday live trading launch  |  Paper trading, $100,000 account, options + equities
+
+1. What We Are Building
+
+An autonomous, multi-agent AI trading system built on Alpaca's Trading API, MCP server, and CLI, operating on a dedicated paper account with a $100,000 starting budget across equities and options. The system moves market data through a graph-based machine learning pipeline, then hands signals to a multi-agent decision layer that debates, sizes, and executes trades without manual intervention.
+
+1.1 Core Data & Modeling Pipeline
+
+The signal-generation path, in sequence:
+
+Alpaca market data ingestion, persisted to SQLite
+
+Topology Builder — constructs the relationship structure between tradable assets
+
+Financial Graph — nodes are assets, edges represent sector, correlation, and supply-chain relationships
+
+GATv2 (Graph Attention Network v2) — learns attention-weighted importance across asset relationships
+
+Attention + Graph Embeddings — produces an interpretable, relationship-aware feature representation
+
+XGBoost + GATv2 hybrid — combines embeddings with gradient-boosted prediction for the trading signal
+
+News-augmented extension (in progress for Monday) — historical and weekend news encoded as node/edge features feeding back into the GATv2 layer, so the graph reflects sentiment and event context, not just price correlation
+
+1.2 Agentic Decision Layer
+
+Signals from the graph/ML pipeline feed a multi-agent orchestration layer (already built across all phases) where specialized agents — bull case, bear case, and risk — evaluate each proposed trade independently before a position is opened. Agent-to-agent (A2A) communication is logged, including proposals, confidence levels, dissent, and the final adjudicated decision. A dynamic topology controller is intended to let the system adjust which relationships and which agents matter most as market conditions shift.
+
+1.3 Execution Plan
+
+Markets are closed Friday through Sunday. That window is being used to run news through the pipeline and stage orders, with live execution and re-validation happening at Monday's open.
+
+2. Failure Point Analysis
+
+The categories below cover where a system like this typically breaks — in backtesting validity, in the modeling pipeline, in multi-agent coordination, in options mechanics, in live execution, and in how it's judged. Treat this as a punch list to close out before Monday, not a list of things that are necessarily currently wrong.
+
+2.1 Data & Backtesting Integrity
+
+Failure Point
+
+Why It Happens
+
+Impact If Unaddressed
+
+Close-Out Action
+
+Look-ahead bias in graph construction
+
+Building the Financial Graph using the full historical dataset at once lets correlations from the future leak into past decision points.
+
+Backtest returns look far better than live performance will — the single most common way a strong-looking hackathon demo falls apart under questioning.
+
+Rebuild the graph on a rolling/walk-forward basis, using only data available as of each decision timestamp. Re-run the backtest this way before Monday.
+
+News timing leakage
+
+Weekend news encoded into node/edge features for historical backtesting may be dated after the price move it's meant to explain.
+
+The news-augmented GATv2 will appear predictive in backtest but won't replicate live.
+
+Timestamp-align news strictly to publish time; when backtesting, mask any news published after the decision point for that day.
+
+Survivorship bias in the trading universe
+
+Testing only on currently-listed, currently-liquid assets ignores delisted or halted names from the backtest period.
+
+Overstates historical performance slightly but consistently.
+
+Note the limitation explicitly in the write-up if not corrected — transparency here reads well to technical judges.
+
+Transaction costs and slippage not modeled
+
+Paper fills are often idealized; backtests frequently assume zero friction.
+
+Strategy edge may be smaller — or negative — once realistic costs are applied, especially with options bid/ask spreads.
+
+Apply a conservative slippage and commission assumption in the backtest and disclose it in the metrics.
+
+2.2 Modeling Pipeline (GATv2 / XGBoost)
+
+Failure Point
+
+Why It Happens
+
+Impact If Unaddressed
+
+Close-Out Action
+
+Overfitting on a short history
+
+GNN + gradient-boosted hybrids have many parameters relative to the amount of clean historical data available.
+
+Strong backtest, weak or random live performance over the 5-day judged window.
+
+Hold out a final validation slice never touched during tuning; report metrics only from that slice.
+
+Attention weight instability
+
+GATv2 attention weights can shift sharply with small input changes, especially with a thin graph (few nodes/edges).
+
+Explanations of 'why' a trade was made become unreliable right when you need them most for the demo.
+
+Sanity-check attention weights across consecutive days for the same assets; flag and smooth abrupt swings rather than trusting them blindly.
+
+Cold-start on new or newly-connected nodes
+
+Assets with limited history or newly added edges have weak embeddings.
+
+Signal quality degrades unevenly across the portfolio without an obvious cause.
+
+Apply a minimum-history filter before an asset is eligible for a live signal.
+
+News embedding pipeline unfinished by Monday
+
+It's being built over a single weekend under time pressure.
+
+Risk of a half-working feature causing worse decisions than not having it at all.
+
+Feature-flag it — keep the pre-news pipeline as the default execution path, and only promote the news-augmented path once its walk-forward backtest clears your existing baseline.
+
+2.3 Multi-Agent Orchestration
+
+Failure Point
+
+Why It Happens
+
+Impact If Unaddressed
+
+Close-Out Action
+
+Agent deadlock or contradictory signals
+
+Bull, bear, and risk agents can disagree with no clear resolution rule.
+
+Missed trades, stalled decisions, or inconsistent behavior that's hard to explain live in the demo.
+
+Define and log an explicit tie-break rule (e.g., risk agent has veto power; ties default to no-trade).
+
+Non-determinism across runs
+
+LLM-based agent reasoning can produce different outputs on identical inputs.
+
+Backtest results aren't reproducible, which undermines credibility with judges who ask you to re-run it.
+
+Fix random seeds where possible; log full agent inputs/outputs so any run can be explained even if not bit-for-bit reproducible.
+
+Latency in agent-to-agent exchange
+
+Sequential multi-agent debate takes real wall-clock time before an order is placed.
+
+At market open, slower decisions can mean worse fills during the most volatile minutes of the day.
+
+Time-box the debate loop; have a fallback single-agent fast path for high-volatility opens.
+
+Silent error propagation
+
+If one agent fails or times out, the orchestration layer may proceed with incomplete input.
+
+A bad or missing signal gets treated as a real one and acted on.
+
+Require explicit confirmation from every agent before a trade is allowed to execute; fail closed, not open.
+
+2.4 Options Mechanics
+
+Failure Point
+
+Why It Happens
+
+Impact If Unaddressed
+
+Close-Out Action
+
+Assignment and expiration handling
+
+Options behavior (assignment, exercise, expiration) is more complex than equities and easy to under-model.
+
+Positions can behave unexpectedly right when you're not watching, over the weekend or mid-week.
+
+Explicitly check expiration dates against your 5-day window before Monday; avoid same-week expiries unless intentional.
+
+Wide bid/ask spreads on paper fills
+
+Less liquid options chains can show unrealistic paper fills at the midpoint.
+
+P&L looks better on paper than a live options strategy would realistically achieve.
+
+Restrict the options universe to liquid, high-open-interest names/strikes.
+
+Greeks not factored into position sizing
+
+A signal-driven system optimized for equities may size options positions without accounting for delta/theta/vega exposure.
+
+Effective risk is larger than intended, especially through a weekend gap.
+
+Have the risk agent explicitly check greeks-based exposure limits, not just notional position size.
+
+2.5 Live Execution (Monday Open)
+
+Failure Point
+
+Why It Happens
+
+Impact If Unaddressed
+
+Close-Out Action
+
+Weekend gap risk
+
+Orders staged from Friday/weekend news analysis are based on stale prices once Monday opens.
+
+Pre-staged orders can execute at prices that no longer make sense given the actual open.
+
+Re-validate every staged order against Monday's actual open price and volatility before firing — treat staging as a draft, not a commitment.
+
+API rate limits / order rejections
+
+Bursty order submission at open, especially across multiple agents, can hit Alpaca API limits or get rejected.
+
+Missed entries or partial execution of the intended strategy right when it matters most for the demo.
+
+Add retry-with-backoff and explicit handling for rejected/partial orders, with a log entry either way.
+
+Single point of failure in SQLite under concurrent agent writes
+
+Multiple agents writing state simultaneously can hit database locking issues.
+
+A crash or silent write failure mid-trading-day, with no clear record of what happened.
+
+Confirm write-ahead logging (WAL) mode is enabled, or move to a queue in front of the DB for the live window.
+
+No kill switch
+
+Fully autonomous systems need a fast manual override if something behaves unexpectedly live.
+
+A single bad signal compounding across multiple trades before anyone notices.
+
+Build and test a manual pause/halt-all-trading control before Monday morning.
+
+2.6 Judging & Presentation Risk
+
+Failure Point
+
+Why It Happens
+
+Impact If Unaddressed
+
+Close-Out Action
+
+5 days is not statistically meaningful
+
+A short live window can show a good or bad number purely from variance, not skill.
+
+Judges who understand markets may discount a raw P&L number on its own.
+
+Lead with risk-adjusted metrics and the benchmark comparison (vs. SPY), not the raw dollar P&L, in the pitch.
+
+Complexity outpaces the demo's ability to explain it
+
+Six pipeline stages plus multi-agent orchestration plus a news layer is a lot to walk through in a short demo slot.
+
+Judges leave impressed by ambition but unclear on what actually happened and why it worked.
+
+Script the demo around 2-3 concrete trades end-to-end (signal → agent debate → decision → outcome), not a full architecture walkthrough.
+
+Unfinished pieces presented as finished
+
+The news-augmented GATv2 layer is still being built this weekend under time pressure.
+
+A question that pokes at the newest, least-tested part of the system is the most likely place a technical judge finds a gap.
+
+Be ready to clearly separate 'validated and live' from 'built but not yet fully validated' in the pitch — judges respond well to honest scoping.
+
+3. Pre-Monday Close-Out Checklist
+
+Backtest, walk-forward, not single-pass — rebuild the graph rolling forward through time, no full-history leakage.
+
+Benchmark every return figure against SPY/QQQ over the identical window.
+
+Report Sharpe, Sortino, max drawdown, and win rate alongside raw P&L, not instead of it.
+
+News feature: feature-flagged, walk-forward validated, and defaults off if it doesn't beat the existing baseline by Sunday night.
+
+A2A decision logs capture proposal, confidence, dissent, and final call for every trade — this is your demo script.
+
+Explicit agent tie-break rule documented and tested (who wins on disagreement).
+
+Options universe restricted to liquid names/strikes; expirations checked against the 5-day window.
+
+Risk agent checks greeks exposure, not just notional position size.
+
+Monday-open re-validation step confirmed to run before any pre-staged order fires.
+
+Kill switch built and tested before live trading starts.
+
+Demo script drafted around 2-3 real trades end-to-end, with an honest note on what's fully validated vs. newly added.
+
+4. Updated Scoring Guidance (from hackathon admin)
+
+Clarified scoring approach as of the admin's most recent message — this supersedes the benchmark-comparison assumption in earlier drafts of this document.
+
+Performance is judged on total account equity during the official scoring window, not on absolute P&L in isolation.
+
+Risk-adjusted metrics (Sharpe, Sortino) are not explicitly part of scoring — track them internally for tuning and as backup answers, but don't lead the pitch with them.
+
+No benchmark comparison (e.g., vs. SPY) is indicated as part of scoring — drop that framing from the demo.
+
+Creativity, autonomy, and robustness of the trading workflow are explicit judged criteria alongside equity performance.
+
+4.1 What This Changes
+
+Equity curve shape matters more than a single end number. "Total equity during the window" suggests continuous tracking, not just start/end — a steady, sustained curve should read better than a high-variance spike-then-giveback pattern, even at similar final totals.
+
+Lead the demo with creativity, autonomy, and robustness, not with risk metrics. The GATv2 + XGBoost + news-augmented graph pipeline is the creativity story; the multi-agent A2A debate loop is the autonomy story; the failure-mode close-out list (Section 2 and 3 above) is the robustness story.
+
+No need to over-optimize for risk-adjusted purity. Without explicit Sharpe/Sortino scoring, a big drawdown still directly hurts the equity number with no offsetting credit — so the target stays steady, explainable equity growth, not a high-variance swing for a large number.
+
+5. Positioning Note: Conservative Strategy ("Beleth" Reference Point)
+
+A participant reported their agent, Beleth, closed day one with a slim ~$373 profit (0.37% on $100k) on a deliberately cautious, conservative options approach. This is a useful reference point for calibrating posture, not a number to target directly — a single day's result from another team reflects their specific sizing, options structure, and market luck, none of which is reproducible on demand.
+
+5.1 What Is Actually Controllable
+
+Small position sizing relative to account value per trade
+
+Defined-risk options structures (covered calls, cash-secured puts, capped spreads) over naked directional bets
+
+Tight risk-agent limits on notional exposure and greeks (delta/theta/vega), not just position count
+
+Trading on higher-confidence signals only, rather than firing on every marginal GATv2/XGBoost output — fewer, better trades reduce exposure to slippage and spread costs
+
+If the risk agent's sizing and greeks limits are already tight, a slim-but-positive day is a plausible and expected outcome of the existing architecture — it does not require a different model. The priority is confirming those limits are enforced tightly enough in practice, not chasing a specific competitor's number.
+
+This document is a working risk register, not a final report — update it as items are closed out through the weekend.

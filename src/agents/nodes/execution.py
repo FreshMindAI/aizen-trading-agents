@@ -25,7 +25,7 @@ from ..protocol import AgentObservation
 logger = logging.getLogger(__name__)
 
 
-def build_node(llm, config: dict[str, Any], risk_limits):
+def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
     role = "Validate and submit the OrderIntent through the broker."
 
     def node(state: DecisionState) -> dict[str, Any]:
@@ -74,7 +74,21 @@ def _validate_intent(intent: OrderIntent) -> bool:
     for leg in intent.legs:
         if leg.quantity <= 0:
             return False
-        if leg.strike <= 0:
+        # Equity legs: no strike/expiry/option_type. The symbol is the
+        # underlying ticker (e.g. AAPL). Side must be BUY for the
+        # long-only equity path; SELL would be a short-sale which the
+        # risk engine does not authorize.
+        if leg.asset_class == "equity":
+            if leg.side != Side.BUY:
+                return False
+            if not leg.contract_symbol:
+                return False
+            # limit_price (if set) must be positive.
+            if leg.limit_price is not None and leg.limit_price <= 0:
+                return False
+            continue
+        # Option legs: strike required, side BUY or SELL.
+        if leg.strike is None or leg.strike <= 0:
             return False
         if leg.side not in (Side.BUY, Side.SELL):
             return False
@@ -82,6 +96,7 @@ def _validate_intent(intent: OrderIntent) -> bool:
 
 
 def _dry_run_submission(intent: OrderIntent) -> dict[str, Any]:
+    asset_classes = sorted({leg.asset_class for leg in intent.legs})
     return {
         "status": "dry_run",
         "submitted_at": _now_iso(),
@@ -90,6 +105,7 @@ def _dry_run_submission(intent: OrderIntent) -> dict[str, Any]:
         "broker": intent.broker,
         "account_mode": intent.account_mode,
         "qty": intent.quantity,
+        "asset_classes": asset_classes,
     }
 
 

@@ -45,7 +45,7 @@ def _load_yaml_bundle() -> dict[str, dict[str, Any]]:
     """Load every config/*.yaml once per process and merge the small subset
     that the rest of the codebase expects as flat fields."""
     bundle: dict[str, dict[str, Any]] = {}
-    for name in ("settings", "alpaca", "agents", "risk"):
+    for name in ("settings", "alpaca", "agents", "risk", "gnn"):
         bundle[name] = _read_yaml(CONFIG_DIR / f"{name}.yaml")
     return bundle
 
@@ -82,13 +82,27 @@ class Settings:
     backoff_cap_s: float = 30.0
     timeout_s: tuple[float, float] = (5.0, 30.0)
 
-    db_path: Path = PROJECT_ROOT / "data" / "trading.db"
+    db_path: Path = field(
+        default_factory=lambda: Path(
+            os.getenv(
+                "AIZEN_DB_PATH",
+                str(PROJECT_ROOT / "data" / "trading.db"),
+            )
+        )
+    )
 
     # --- Phase-3 multi-agent fields ------------------------------------------
     run_mode: str = "paper"          # paper | dry-run | live
     data_base_url: str = DATA_HOST
     trading_base_url: str = PAPER_HOST
     decision_journal_table: str = "decision_journal"
+
+    # Account capital (USD). Drives the risk engine's per-trade / per-
+    # symbol / gross caps when ``risk.yaml`` is set to "scale from
+    # capital" mode (see ``RiskLimits.scaled_from_capital``). Hackathon
+    # default is $100k so the multi-agent pipeline produces realistic
+    # position sizes; an explicit AIZEN_CAPITAL env var wins.
+    capital_usd: float = 100_000.0
     agent_config_path: Path = CONFIG_DIR / "agents.yaml"
     risk_config_path: Path = CONFIG_DIR / "risk.yaml"
     alpaca_config_path: Path = CONFIG_DIR / "alpaca.yaml"
@@ -148,4 +162,5 @@ def get_settings() -> Settings:
         decision_journal_table=settings_cfg.get(
             "project", {}
         ).get("decision_journal_table", Settings.decision_journal_table),
+        capital_usd=_env_float("AIZEN_CAPITAL", Settings.capital_usd),
     )

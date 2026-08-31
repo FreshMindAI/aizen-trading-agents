@@ -1,0 +1,48 @@
+name: Deploy dashboard to GitHub Pages
+
+# Publishes dashboard/index.html to the gh-pages branch on every push to
+# main. Render also runs scripts/build_dashboard.py on every cron tick
+# so the rendered file is always fresh when this workflow runs.
+#
+# Setup: in GitHub, go to Settings -> Pages -> Build & deployment ->
+# Source = "GitHub Actions". No other config needed.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "dashboard/index.html"
+      - ".github/workflows/dashboard.yml"
+      - "scripts/build_dashboard.py"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dashboard
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -11,12 +11,17 @@ chat.completions schema:
 
 Then we map the response back into LLMResponse. `tool_calls` carries the
 function name + JSON args; `text` is the assistant message content.
+
+Retry behaviour is delegated to ``LLMProvider._call_with_retry`` so the
+exact same bounded exponential-backoff schedule is shared with
+``AnthropicProvider``.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any
 
@@ -31,6 +36,7 @@ from .base import (
     OPENAI_DEFAULT_MODEL,
     ToolSpec,
 )
+from .telemetry import LLMCallTelemetry
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +51,7 @@ class OpenAIProvider(LLMProvider):
 
     def __init__(self, base_url: str | None = None, default_model: str | None = None,
                  api_key: str | None = None, timeout_s: int = 60,
-                 max_retries: int = 2, organization: str | None = None,
+                 max_retries: int | None = None, organization: str | None = None,
                  force_json_response: bool = True) -> None:
         super().__init__(base_url=base_url, default_model=default_model,
                          api_key=api_key, timeout_s=timeout_s)
@@ -54,7 +60,12 @@ class OpenAIProvider(LLMProvider):
                 "OPENAI_API_KEY is not set. Export it (or pass api_key=...) before "
                 "constructing OpenAIProvider."
             )
-        self.max_retries = max_retries
+        # Legacy ``max_retries`` kwarg controls total attempt count via
+        # _call_with_retry. None falls back to the env / 4 default.
+        if max_retries is not None:
+            self._max_attempts_override = max(1, int(max_retries) + 1)
+        else:
+            self._max_attempts_override = None
         import os as _os
         self.organization = organization or _os.getenv("OPENAI_ORG_ID")
         self.force_json_response = force_json_response
@@ -70,34 +81,23 @@ class OpenAIProvider(LLMProvider):
     def complete(self, request: LLMRequest) -> LLMResponse:
         body = self._build_body(request)
         url = f"{self.base_url}/v1/chat/completions"
-        last_err: Exception | None = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                resp = self._session.post(
-                    url, json=body, timeout=self.timeout_s,
-                )
-            except requests.RequestException as exc:
-                last_err = exc
-                if attempt < self.max_retries:
-                    self._backoff(attempt)
-                    continue
-                raise LLMError(f"openai transport error: {exc}") from exc
-
-            if resp.status_code >= 500 and attempt < self.max_retries:
-                last_err = RuntimeError(f"http {resp.status_code}")
-                self._backoff(attempt)
-                continue
-            if resp.status_code in (408, 429) and attempt < self.max_retries:
-                last_err = RuntimeError(f"http {resp.status_code}")
-                self._backoff(attempt, retry_after=resp.headers.get("retry-after"))
-                continue
-            if resp.status_code >= 400:
-                raise LLMError(f"openai {resp.status_code}: {resp.text[:500]}")
-            try:
-                return self._parse(resp.json())
-            except (ValueError, KeyError) as exc:
-                raise LLMError(f"openai returned unparseable body: {exc}") from exc
-        raise LLMError(f"openai giving up after retries: {last_err}")
+        model = request.model or self.default_model
+        telemetry = LLMCallTelemetry(
+            provider=self.PROVIDER_NAME, model=model,
+        )
+        try:
+            payload = self._call_with_retry(
+                telemetry=telemetry,
+                perform=lambda: self._session.post(url, json=body, timeout=self.timeout_s),
+                parse=lambda r: r.json(),
+                max_attempts=self._max_attempts_override,
+                retry_after_for=self._retry_after_for,
+            )
+        except Exception:
+            self.last_call = telemetry
+            raise
+        self.last_call = telemetry
+        return self._parse(payload)
 
     # ---- request translation -------------------------------------------
     def _build_body(self, req: LLMRequest) -> dict[str, Any]:
@@ -177,10 +177,20 @@ class OpenAIProvider(LLMProvider):
         )
 
     def _backoff(self, attempt: int, retry_after: str | None = None) -> None:
-        if retry_after:
-            try:
-                time.sleep(min(float(retry_after), 30.0))
-                return
-            except ValueError:
-                pass
-        time.sleep(min(0.5 * (2 ** attempt), 10.0))
+        # Kept for backwards compatibility with any external callers that
+        # imported the private method. New retry logic lives in the
+        # base class's _call_with_retry; this is a no-op shim.
+        return
+
+    @staticmethod
+    def _retry_after_for(resp: "requests.Response") -> float | None:
+        """Parse the Retry-After header (seconds). Returns None if absent
+        or unparseable. OpenAI emits Retry-After on 429 responses; we
+        cap it via max_delay_s in the helper."""
+        ra = resp.headers.get("retry-after")
+        if not ra:
+            return None
+        try:
+            return float(ra)
+        except (TypeError, ValueError):
+            return None

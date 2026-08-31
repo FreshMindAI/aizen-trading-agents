@@ -21,7 +21,10 @@ def utc_now_iso() -> str:
 
 
 def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
-    path = Path(db_path) if db_path else PROJECT_ROOT / "data" / "trading.db"
+    import os
+    if db_path is None:
+        db_path = os.getenv("AIZEN_DB_PATH", str(PROJECT_ROOT / "data" / "trading.db"))
+    path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
@@ -33,11 +36,50 @@ def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection, sql_dir: Path | None = None) -> list[str]:
-    """Apply every sql/*.sql script in sorted filename order. Idempotent."""
+    """Apply every sql/*.sql script in sorted filename order. Idempotent.
+
+    Tracks applied migrations in a ``schema_migrations`` table so re-runs
+    are safe even when scripts include non-idempotent statements like
+    ``ALTER TABLE ADD COLUMN``. The very first run back-fills every existing
+    script as already-applied (so pre-existing DBs are not double-mutated).
+    """
     directory = sql_dir or SQL_DIR
+    # Bootstrap the migrations table.
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS schema_migrations ("
+        "  filename TEXT PRIMARY KEY,"
+        "  applied_at TEXT NOT NULL"
+        ");"
+    )
+    # Detect first-ever run on a pre-existing DB: if no row exists and the
+    # DB already has user tables, mark every shipped script as applied.
+    already = {r["filename"] for r in conn.execute("SELECT filename FROM schema_migrations").fetchall()}
+    has_user_tables = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name NOT IN ('schema_migrations') LIMIT 1"
+    ).fetchone() is not None
+    if not already and has_user_tables:
+        # Backfill all currently shipped scripts as already-applied.
+        all_scripts = sorted(p.name for p in directory.glob("*.sql"))
+        now = utc_now_iso()
+        for name in all_scripts:
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (filename, applied_at) VALUES (?, ?)",
+                (name, now),
+            )
+        conn.commit()
+        already = set(all_scripts)
     applied: list[str] = []
     for script in sorted(directory.glob("*.sql")):
+        if script.name in already:
+            continue
+        # Some scripts (notably ALTER TABLE ADD COLUMN) raise on re-run. We
+        # track by filename, so this path only runs once per filename.
         conn.executescript(script.read_text(encoding="utf-8"))
+        conn.execute(
+            "INSERT INTO schema_migrations (filename, applied_at) VALUES (?, ?)",
+            (script.name, utc_now_iso()),
+        )
         applied.append(script.name)
     conn.commit()
     return applied

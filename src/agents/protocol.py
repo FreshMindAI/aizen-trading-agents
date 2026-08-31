@@ -46,6 +46,7 @@ class MessageType(str, Enum):
     REGIME_VIEW = "REGIME_VIEW"
     DIRECTION_VIEW = "DIRECTION_VIEW"
     VOLATILITY_VIEW = "VOLATILITY_VIEW"
+    RESEARCH_VIEW = "RESEARCH_VIEW"
     STRATEGY_PROPOSAL = "STRATEGY_PROPOSAL"
     PORTFOLIO_VIEW = "PORTFOLIO_VIEW"
     RISK_DECISION = "RISK_DECISION"
@@ -103,6 +104,10 @@ class UnderlyingScore(StrictModel):
     gnn_directional_bias: float | None = None  # [-1, +1]
     gnn_centrality: float | None = None
     model_version: str | None = None
+    # Latest close price (point-in-time) — used by the equity candidate
+    # generator to size the long-equity leg. Optional so legacy callers
+    # that build an UnderlyingScore without a price still work.
+    last_price: float | None = None
 
 
 class OptionScore(StrictModel):
@@ -140,6 +145,33 @@ class MarketSnapshot(StrictModel):
     portfolio: list[PortfolioPosition] = Field(default_factory=list)
     account_equity: float | None = None
     account_cash: float | None = None
+    research: "ResearchOutput | None" = None  # populated only when agents.research.enabled is true
+
+
+# ---------------------------------------------------------------------------
+# Research output (spec 003 / FR-001, FR-011, FR-014)
+# ---------------------------------------------------------------------------
+class SymbolResearch(StrictModel):
+    """One ticker's research aggregate. Strict (extra=forbid). NaN/inf -> None."""
+    sentiment: float | None = Field(default=None, ge=-1.0, le=1.0)
+    volume: int = Field(ge=0, default=0)
+    topics: list[str] = Field(default_factory=list, max_length=3)
+    last_article_at: str | None = None
+
+
+class ResearchOutput(StrictModel):
+    """Per-cycle output of the research agent.
+
+    `version` is the schema version (constitution §II).
+    `timestamp` is the decision-cycle timestamp (NOT any article timestamp).
+    `per_symbol` is keyed by ticker in the universe; an empty dict means
+    'no news in the prior 24h for any symbol' (a valid state).
+    """
+    version: Literal["1.0"] = "1.0"
+    timestamp: str
+    per_symbol: dict[str, SymbolResearch] = Field(default_factory=dict)
+    feature_flag_state: Literal["news-on", "news-off"] = "news-on"
+    risks: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -161,12 +193,13 @@ class AgentObservation(StrictModel):
 # Strategy proposal
 # ---------------------------------------------------------------------------
 class Leg(StrictModel):
+    asset_class: Literal["equity", "option"] = "option"
     contract_symbol: str
     side: Side
     quantity: int = Field(gt=0)
-    option_type: OptionType
-    strike: float
-    expiry: str                            # YYYY-MM-DD
+    option_type: OptionType | None = None   # required when asset_class='option'
+    strike: float | None = None             # required when asset_class='option'
+    expiry: str | None = None               # YYYY-MM-DD; required when asset_class='option'
     limit_price: float | None = None       # None = market
 
 

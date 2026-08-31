@@ -27,6 +27,11 @@ from .base import (  # noqa: F401
     ToolSpec,
     get_provider,
 )
+from .telemetry import (  # noqa: F401
+    LLMCallAttempt,
+    LLMCallTelemetry,
+    LLMTransportError,
+)
 
 __all__ = [
     "ANTHROPIC_API_VERSION",
@@ -34,11 +39,14 @@ __all__ = [
     "ANTHROPIC_DEFAULT_MODEL",
     "OPENAI_DEFAULT_BASE_URL",
     "OPENAI_DEFAULT_MODEL",
+    "LLMCallAttempt",
+    "LLMCallTelemetry",
     "LLMError",
     "LLMMessage",
     "LLMProvider",
     "LLMRequest",
     "LLMResponse",
+    "LLMTransportError",
     "ToolSpec",
     "get_provider",
 ]

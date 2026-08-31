@@ -21,6 +21,32 @@ risk:
 
   # Universe / instrument filters
   allowed_underlyings: [SPY, QQQ, AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, AMD]
-  allowed_expiries_dte_min: 7
-  allowed_expiries_dte_max: 60
+  # Hackathon sizing: 1-week window (2026-08-28 -> 2026-09-04). The XGBoost
+  # model has a 4-bar (~1h) forward horizon, so holding an option 25-60 days
+  # to expiry bleeds the premium to theta before the signal can play out.
+  # Aug-17 AMZN introspection: dir_prob=0.582 (BULL) but 5 calls with DTE
+  # 25-60 lost $625 because AMZN was flat (262.08 -> 262.04) over 11 days
+  # and theta ate the premium. DTE 5-10 keeps the trade inside the model's
+  # signal-decay window.
+  allowed_expiries_dte_min: 5
+  allowed_expiries_dte_max: 10
   require_liquid_underlying: true
+
+  # Equity (stock) leg limits. The parallel options+stocks path emits a
+  # long-equity candidate when the directional signal is strong but the
+  # option chain is empty or the score is below the option threshold.
+  # Sized for a 1-week hackathon paper account: $1.5k/symbol cap avoids
+  # concentrating a single name; $5k total cap leaves headroom for one
+  # equity + one option leg in the same cycle.
+  # NOTE: equity legs require non-margin cash. In a margin account the
+  # Pattern Day Trader rule applies — 4+ day trades in 5 trading days
+  # forces the $25k minimum. We are running cash (paper) so this is moot
+  # for the hackathon, but documented for the future.
+  max_equity_notional_per_symbol: 1500.0
+  max_equity_notional_total: 5000.0
+  min_equity_direction_probability: 0.55
+  # Tie-breaker when both option and equity candidates clear the score
+  # gate. 0.0 = options win (default; current behavior). Positive value
+  # means equity is preferred when its score is this much higher than
+  # the option score. Negative = options are always preferred.
+  equity_preferred_when_score_margin: 0.0

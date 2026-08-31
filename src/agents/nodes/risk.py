@@ -18,7 +18,7 @@ from ..protocol import (
 from ..risk import evaluate
 
 
-def build_node(llm, config: dict[str, Any], risk_limits):
+def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
     # `llm` is unused - the risk engine is deterministic by design.
     _ = llm
 

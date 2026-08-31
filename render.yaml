@@ -1,0 +1,56 @@
+# Render Blueprint: Aizen Trading hackathon cron loop.
+#
+# 15-minute cadence, single-cycle per tick, persistent SQLite on a
+# Render-managed disk. See DEPLOYMENT.md for setup steps and the
+# required env-var wiring.
+#
+# After updating this file:
+#   1. Push to a connected Git branch.
+#   2. In Render, "New +" -> "Blueprint" -> point at the repo.
+#   3. Render will create the cron job and the persistent disk from
+#      this spec. Set the env vars listed below (Dashboard ->
+#      Environment -> Add from .env.example values).
+services:
+  - type: cron
+    name: aizen-trading-loop
+    runtime: docker
+    # Every 15 minutes. Render's cron accepts standard 5-field cron.
+    schedule: "*/15 * * * *"
+    region: oregon
+    plan: starter
+    # 5-minute hard cap on each tick. 99% of cycles complete in <30s.
+    # The cap is a safety net so a stuck cycle can't pin the disk.
+    maxRunDuration: 5m
+    disk:
+      name: aizen-data
+      mountPath: /var/data/aizen
+      sizeGB: 1
+    envVars:
+      # --- Database ---
+      - key: AIZEN_DB_PATH
+        value: /var/data/aizen/trading.db
+      # --- Alpaca paper trading ---
+      # Fill these in from the Render Dashboard with the paper-account keys.
+      - key: ALPACA_API_KEY_ID
+        sync: false
+      - key: ALPACA_API_SECRET_KEY
+        sync: false
+      # --- LLM (default: mock, never hits the network) ---
+      - key: AIZEN_LLM_PROVIDER
+        value: mock
+      # To use Anthropic in production, add:
+      # - key: AIZEN_LLM_PROVIDER
+      #   value: anthropic
+      # - key: ANTHROPIC_AUTH_TOKEN
+      #   sync: false
+      # - key: ANTHROPIC_BASE_URL
+      #   value: https://api.gmi-serving.com
+      # - key: ANTHROPIC_MESSAGES_PATH
+      #   value: /v1/messages
+      # --- Loop config ---
+      - key: RUN_MODE
+        value: paper
+      - key: AIZEN_TRACE
+        value: "1"
+      - key: LOG_LEVEL
+        value: INFO

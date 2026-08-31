@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Aizen Trading Dashboard</title>
+  <style>
+:root {
+  --bg: #fafafa;
+  --fg: #1a1a1a;
+  --muted: #6b6b6b;
+  --accent: #2962ff;
+  --good: #1b8e3a;
+  --bad: #c62828;
+  --neutral: #555;
+  --line: #e6e6e6;
+  --card: #ffffff;
+  --shadow: 0 1px 3px rgba(0,0,0,0.08);
+  --radius: 8px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115;
+    --fg: #e8e8e8;
+    --muted: #9aa0a6;
+    --accent: #82b1ff;
+    --good: #4caf50;
+    --bad: #ef5350;
+    --line: #2a2d33;
+    --card: #161a1f;
+    --shadow: 0 1px 3px rgba(0,0,0,0.4);
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; line-height: 1.5; }
+.wrap { max-width: 1100px; margin: 0 auto; padding: 24px 20px 80px; }
+header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+h1 { font-size: 22px; font-weight: 600; margin: 0; }
+h2 { font-size: 16px; font-weight: 600; margin: 0 0 12px; color: var(--fg); }
+.sub { color: var(--muted); font-size: 13px; }
+.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 24px; }
+.kpi { background: var(--card); border-radius: var(--radius); padding: 14px 16px; box-shadow: var(--shadow); }
+.kpi .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+.kpi .value { font-size: 22px; font-weight: 600; font-family: var(--mono); margin-top: 4px; }
+.kpi.good .value { color: var(--good); }
+.kpi.bad .value { color: var(--bad); }
+.card { background: var(--card); border-radius: var(--radius); padding: 18px 20px; box-shadow: var(--shadow); margin-bottom: 20px; }
+.empty { color: var(--muted); font-style: italic; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+tr:last-child td { border-bottom: none; }
+td.num { font-family: var(--mono); text-align: right; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.04em; }
+.badge.proceed { background: rgba(27,142,58,0.12); color: var(--good); }
+.badge.reduce { background: rgba(255,152,0,0.14); color: #ef6c00; }
+.badge.reject { background: rgba(198,40,40,0.12); color: var(--bad); }
+.badge.no_trade { background: rgba(0,0,0,0.06); color: var(--neutral); }
+.badge.equity { background: rgba(41,98,255,0.12); color: var(--accent); }
+.badge.option { background: rgba(0,150,136,0.12); color: #00796b; }
+.kv { display: grid; grid-template-columns: 140px 1fr; gap: 6px 16px; font-size: 13px; }
+.kv .k { color: var(--muted); }
+.kv .v { font-family: var(--mono); word-break: break-word; }
+.signal-row { display: grid; grid-template-columns: 200px 120px 1fr 80px; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+.signal-row:last-child { border-bottom: none; }
+.signal-row .conf { font-family: var(--mono); text-align: right; }
+.sparkline { display: block; width: 100%; height: 60px; margin-top: 12px; }
+footer { color: var(--muted); font-size: 11px; margin-top: 32px; text-align: center; }
+code { font-family: var(--mono); background: rgba(0,0,0,0.04); padding: 1px 5px; border-radius: 3px; }
+@media (max-width: 600px) { .kpi-row { grid-template-columns: repeat(2, 1fr); } .kv { grid-template-columns: 100px 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Aizen Trading — Live Dashboard</h1>
+      <div class="sub">Built 2026-08-30T13:39:32Z · 116 cycles on record</div>
+    </div>
+    <div class="sub">
+      Last cycle: <code>2026-08-29T20:25:56Z</code><br>
+      Last action: <span class="badge no_trade">NO_TRADE</span>
+    </div>
+  </header>
+
+  <div class="kpi-row">
+    <div class="kpi ">
+      <div class="label">Total realized P&amp;L</div>
+      <div class="value">—</div>
+    </div>
+    <div class="kpi ">
+      <div class="label">Today</div>
+      <div class="value">—</div>
+    </div>
+    <div class="kpi ">
+      <div class="label">Last 7 days</div>
+      <div class="value">—</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Trades</div>
+      <div class="value">0</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Win rate</div>
+      <div class="value">0%</div>
+    </div>
+    <div class="kpi">
+      <div class="label">W / L</div>
+      <div class="value">0 / 0</div>
+    </div>
+    <div class="kpi bad">
+      <div class="label">Max drawdown</div>
+      <div class="value">—</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Sharpe (approx)</div>
+      <div class="value">—</div>
+    </div>
+  </div>
+
+  <section class="card">
+    <h2>Next-day plan</h2>
+    
+    <div class="kv">
+      <div class="k">Decision</div><div class="v"><code>3b3c78ba-4630-49b7-ab11-b6509326cbd2</code></div>
+      <div class="k">Cycle at</div><div class="v">2026-08-29T19:43:47Z</div>
+      <div class="k">Underlying</div><div class="v"><strong>MSFT</strong></div>
+      <div class="k">Score</div><div class="v">0.5016920191794634</div>
+      <div class="k">Thesis</div><div class="v">Long call on MSFT with P(profit)=0.73, expected return=0.341, gnn_bias=+0.64.</div>
+      <div class="k">Legs</div><div class="v"><ul style="margin:0; padding-left:16px;"><li>buy 1× MSFT260918C00490000 (?)</li></ul></div>
+    </div>
+    
+  </section>
+
+  <section class="card">
+    <h2>Equity curve (cumulative realized P&amp;L)</h2>
+    <div class="empty">No reconciled trades yet.</div>
+  </section>
+
+  <section class="card">
+    <h2>Recent cycles</h2>
+    
+    <table>
+      <thead>
+        <tr>
+          <th>decision</th><th>timestamp (UTC)</th><th>underlying</th>
+          <th>action</th><th>class</th><th>score</th>
+          <th>fill</th><th>realized PnL</th><th>outcome</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>28446535…</code></td>
+          <td>2026-08-29T20:25:56</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>ERROR</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>3b3c78ba…</code></td>
+          <td>2026-08-29T19:43:47</td>
+          <td><strong>MSFT</strong></td>
+          <td><span class="badge proceed">PROCEED</span></td>
+          <td><span class="badge option">option</span></td>
+          <td class="num">0.502</td>
+          <td>dry_run</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>cfaf4694…</code></td>
+          <td>2026-08-29T19:29:31</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge proceed">PROCEED</span></td>
+          <td><span class="badge option">option</span></td>
+          <td class="num">0.358</td>
+          <td>dry_run</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>cb9505f2…</code></td>
+          <td>2026-08-29T19:27:42</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge proceed">PROCEED</span></td>
+          <td><span class="badge option">option</span></td>
+          <td class="num">0.358</td>
+          <td>dry_run</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>c6ea0f2b…</code></td>
+          <td>2026-08-29T19:26:38</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge proceed">PROCEED</span></td>
+          <td><span class="badge option">option</span></td>
+          <td class="num">0.358</td>
+          <td>dry_run</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>1fd64d73…</code></td>
+          <td>2026-08-29T19:25:31</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge proceed">PROCEED</span></td>
+          <td><span class="badge option">option</span></td>
+          <td class="num">0.358</td>
+          <td>dry_run</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>7ee7e115…</code></td>
+          <td>2026-08-29T19:24:22</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge proceed">PROCEED</span></td>
+          <td><span class="badge option">option</span></td>
+          <td class="num">0.358</td>
+          <td>dry_run</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>60601b2d…</code></td>
+          <td>2026-08-29T19:23:09</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge proceed">PROCEED</span></td>
+          <td><span class="badge option">option</span></td>
+          <td class="num">0.358</td>
+          <td>dry_run</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>655d3e22…</code></td>
+          <td>2026-08-29T19:21:59</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge proceed">PROCEED</span></td>
+          <td><span class="badge option">option</span></td>
+          <td class="num">0.358</td>
+          <td>dry_run</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>0fb2927a…</code></td>
+          <td>2026-08-29T19:19:33</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge proceed">PROCEED</span></td>
+          <td><span class="badge option">option</span></td>
+          <td class="num">0.358</td>
+          <td>dry_run</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>5a2bb00f…</code></td>
+          <td>2026-08-29T19:16:45</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>661b4343…</code></td>
+          <td>2026-08-29T19:15:34</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>af20cd79…</code></td>
+          <td>2026-08-29T19:14:03</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>c5e2e4f6…</code></td>
+          <td>2026-08-29T19:12:51</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>4c6f2c54…</code></td>
+          <td>2026-08-29T19:11:39</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>d4d0ff1f…</code></td>
+          <td>2026-08-29T19:09:41</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>338fa613…</code></td>
+          <td>2026-08-29T19:08:27</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>b49141c1…</code></td>
+          <td>2026-08-29T19:07:15</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>0efcdc2c…</code></td>
+          <td>2026-08-29T19:05:18</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>b8fc4067…</code></td>
+          <td>2026-08-29T19:03:17</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>5dd705da…</code></td>
+          <td>2026-08-29T19:01:29</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>06a5dd94…</code></td>
+          <td>2026-08-29T18:59:31</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>6d8bbae4…</code></td>
+          <td>2026-08-29T18:57:43</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>ed610869…</code></td>
+          <td>2026-08-29T18:55:48</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        
+        <tr>
+          <td><code>af8ee0d9…</code></td>
+          <td>2026-08-29T18:54:04</td>
+          <td><strong>AAPL</strong></td>
+          <td><span class="badge no_trade">NO_TRADE</span></td>
+          <td><span class="badge no_trade">—</span></td>
+          <td class="num">—</td>
+          <td>—</td>
+          <td class="num">—</td>
+          <td>—</td>
+        </tr>
+        </tbody>
+    </table>
+    
+  </section>
+
+  <section class="card">
+    <h2>Recent agent signals</h2>
+    
+        <div class="signal-row">
+          <div>2026-08-29T19:43:47 · <strong>regime_agent</strong></div>
+          <div>REGIME_VIEW</div>
+          <div>—<br><span class="sub">risks: —</span></div>
+          <div class="conf">0.06</div>
+        </div>
+        
+        <div class="signal-row">
+          <div>2026-08-29T19:43:47 · <strong>direction_agent</strong></div>
+          <div>DIRECTION_VIEW</div>
+          <div>—<br><span class="sub">risks: —</span></div>
+          <div class="conf">0.39</div>
+        </div>
+        
+        <div class="signal-row">
+          <div>2026-08-29T19:43:47 · <strong>volatility_agent</strong></div>
+          <div>VOLATILITY_VIEW</div>
+          <div>—<br><span class="sub">risks: —</span></div>
+          <div class="conf">0.50</div>
+        </div>
+        
+        <div class="signal-row">
+          <div>2026-08-29T19:43:47 · <strong>options_structure_agent</strong></div>
+          <div>STRATEGY_PROPOSAL</div>
+          <div>top_strategy_id=2f812330-0c56-4580-a941-1a1cee42af51<br><span class="sub">risks: —</span></div>
+          <div class="conf">0.50</div>
+        </div>
+        
+        <div class="signal-row">
+          <div>2026-08-29T19:43:47 · <strong>portfolio_agent</strong></div>
+          <div>PORTFOLIO_VIEW</div>
+          <div>—<br><span class="sub">risks: —</span></div>
+          <div class="conf">0.50</div>
+        </div>
+        
+        <div class="signal-row">
+          <div>2026-08-29T19:43:47 · <strong>supervisor</strong></div>
+          <div>SUPERVISOR_DECISION</div>
+          <div>—<br><span class="sub">risks: —</span></div>
+          <div class="conf">0.73</div>
+        </div>
+        
+        <div class="signal-row">
+          <div>2026-08-29T19:43:47 · <strong>execution_agent</strong></div>
+          <div>EXECUTION_RESULT</div>
+          <div>—<br><span class="sub">risks: —</span></div>
+          <div class="conf">0.50</div>
+        </div>
+        
+        <div class="signal-row">
+          <div>2026-08-29T19:29:31 · <strong>regime_agent</strong></div>
+          <div>REGIME_VIEW</div>
+          <div>—<br><span class="sub">risks: —</span></div>
+          <div class="conf">0.05</div>
+        </div>
+        
+  </section>
+
+  <footer>
+    Auto-built by <code>scripts/build_dashboard.py</code> on every Render cron tick ·
+    data source: <code>decision_journal</code> ·
+    view the raw cycle traces in <code>models/cycle_traces/</code>
+  </footer>
+</div>
+</body>
+</html>
