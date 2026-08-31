@@ -1,0 +1,86 @@
+name: Aizen trading cron loop
+
+# Runs `python -m src.agents.cli.run_loop --once` on a 15-minute
+# schedule. This is the GitHub Actions alternative to a Render Cron
+# Job — no payment method required, free for public repos.
+#
+# Setup (one time, in the GitHub repo UI):
+#   1. Settings -> Secrets and variables -> Actions
+#   2. Add repository secrets:
+#        ALPACA_API_KEY_ID
+#        ALPACA_API_SECRET_KEY
+#      (Optional) ANTHROPIC_AUTH_TOKEN — only if you want LLM-backed
+#      reasoning instead of the mock provider.
+#   3. The Actions tab will start ticking on the cron schedule.
+#      A 15-minute drift is fine; the orchestrator is point-in-time
+#      aware so a late tick just runs against slightly fresher data.
+#
+# Manual trigger:
+#   Actions -> "Aizen trading cron loop" -> "Run workflow" -> Run
+#
+# Cost:
+#   Public repo, GitHub-hosted runner, ~30-60s per tick.
+#   15-min cadence = 96 ticks/day = well under 2,000 min/month
+#   free quota.
+
+on:
+  schedule:
+    # 15-min cadence. GitHub's cron doesn't support */15 directly;
+    # we list each quarter-hour explicitly so a missed tick on one
+    # schedule line doesn't break the next.
+    - cron: '0,15,30,45 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: aizen-loop
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cycle:
+    name: One cycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # The pipeline defaults to a local SQLite path. Each tick gets
+      # a fresh ephemeral runner, so this DB is wiped on every
+      # invocation. The live trade journal on Alpaca's side is
+      # the source of truth for what happened.
+      AIZEN_DB_PATH: ${{ github.workspace }}/data/trading.db
+      AIZEN_LLM_PROVIDER: mock
+      RUN_MODE: paper
+      AIZEN_TRACE: '1'
+      LOG_LEVEL: INFO
+      PYTHONUNBUFFERED: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run one cycle
+        env:
+          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          # Optional: only set if you want LLM-backed reasoning.
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          # If you flip AIZEN_LLM_PROVIDER to "anthropic", also set:
+          # ANTHROPIC_BASE_URL and ANTHROPIC_MESSAGES_PATH as
+          # env vars (they're not secrets so they can live in the
+          # env: block above).
+        run: |
+          mkdir -p data
+          python -m src.agents.cli.run_loop --once

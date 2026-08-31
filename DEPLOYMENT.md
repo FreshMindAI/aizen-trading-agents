@@ -1,12 +1,60 @@
-# Deploying to Render (Cron Job)
+# Deploying the cron loop
 
-The hackathon window is **2026-08-28 → 2026-09-04** (5 days from today).
-This guide deploys the multi-agent pipeline as a Render Cron Job that
-runs **one cycle every 15 minutes** during market hours (and around the
-clock — the cycle is cheap, ~10-30s, and uses the mock LLM unless you
-override).
+The pipeline runs **one cycle every 15 minutes** during market hours
+(and around the clock — the cycle is cheap, ~10-30s, and uses the
+mock LLM unless you override). Two deployment paths are supported:
 
-## What gets deployed
+1. **GitHub Actions** (free, recommended for the hackathon)
+2. **Render Cron Job** ($7/mo Starter plan, no card-free option)
+
+The repo ships both a Render `render.yaml` and a GitHub Actions
+workflow at `.github/workflows/cron-loop.yml`. Pick one.
+
+## Option A — GitHub Actions (recommended)
+
+Free for public repos. Each tick is a fresh GitHub-hosted runner
+that runs `python -m src.agents.cli.run_loop --once` and exits.
+Runs 96 ticks/day, ~30-60s each, well under GitHub's 2,000 min/month
+free quota.
+
+### Setup (one time)
+
+1. **Add repository secrets** in the GitHub UI:
+   - `https://github.com/FreshMindAI/aizen-trading-agents/settings/secrets/actions`
+   - Click "New repository secret", add each of:
+     - `ALPACA_API_KEY_ID` — your Alpaca paper account key
+     - `ALPACA_API_SECRET_KEY` — your Alpaca paper account secret
+   - (Optional) `ANTHROPIC_AUTH_TOKEN` — only if you flip
+     `AIZEN_LLM_PROVIDER` to `anthropic` for live LLM reasoning
+
+2. **Trigger the first run**:
+   - `https://github.com/FreshMindAI/aizen-trading-agents/actions/workflows/cron-loop.yml`
+   - Click "Run workflow" → green button.
+   - The Actions tab will show the run; click into it for live logs.
+   - You should see the `_print_summary` block within 30-60s.
+
+3. **Verify on Alpaca**:
+   - `https://app.alpaca.markets/paper/dashboard/orders` shows the
+     placed paper orders. NO_TRADE cycles won't show anything.
+
+4. **Schedule**: the workflow file has `cron: '0,15,30,45 * * * *'`
+   in it — that's the 15-min cadence. GitHub's scheduler has a
+   5-10 min drift; the orchestrator is point-in-time aware so a
+   late tick just runs against slightly fresher data.
+
+### Caveats
+- **Ephemeral disk**: the SQLite DB at `data/trading.db` is wiped
+  every tick. The `decision_journal` and `cycle_traces.jsonl` only
+  accumulate within a single tick. The **Alpaca paper account is
+  the source of truth** for what got traded.
+- **The `decision_journal` table is currently only visible inside
+  the container**, so you can't query historical decisions from
+  your laptop. If you need that, add a step in the workflow that
+  uploads the trace JSONL to S3 / HuggingFace.
+
+## Option B — Render Cron Job
+
+### What gets deployed
 
 - **Service type**: Render Cron Job (not Background Worker — each
   invocation is a fresh process, easier to debug).
