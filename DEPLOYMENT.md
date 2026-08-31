@@ -11,8 +11,12 @@ override).
 - **Service type**: Render Cron Job (not Background Worker — each
   invocation is a fresh process, easier to debug).
 - **Schedule**: `*/15 * * * *` (every 15 min).
-- **Max run duration**: 5 minutes (safety net; cycles complete in 10-30s).
-- **Persistent disk**: 1 GB at `/var/data/aizen` (SQLite DB + trace files).
+- **Run duration**: 12 hours (Render's hard cap on a single tick;
+  cycles complete in 10-30s, so this is a safety net only).
+- **Persistent disk**: NOT supported on Render Cron Jobs — the
+  SQLite DB at `/app/data/trading.db` lives only for the duration
+  of the tick. For a persistent store across ticks, swap
+  `AIZEN_DB_PATH` to a Render Postgres URL.
 - **Image**: built from the `Dockerfile` in this repo.
 - **Entry point**: `python -m src.agents.cli.run_loop --once`.
 
@@ -39,14 +43,15 @@ override).
      within 30s. If you see a stack trace, the most common cause is
      missing Alpaca keys.
 
-5. **Confirm the disk mounted**:
+5. **Confirm the DB written**:
    - Click the running container → "Shell".
-   - `ls -la /var/data/aizen/` should show `trading.db` after the first
-     successful tick.
+   - `ls -la /app/data/` should show `trading.db` after the first
+     successful tick. (It gets reset on the next deploy — see
+     "Persistent disk" caveat above.)
 
 ## Per-tick lifecycle
 
-1. **Init**: open SQLite at `/var/data/aizen/trading.db`, run
+1. **Init**: open SQLite at `/app/data/trading.db`, run
    `init_db()` (idempotent schema).
 2. **Data refresh**: pull the latest 1-bar from Alpaca for the
    10-name universe. Failures log a warning and continue on stale data.

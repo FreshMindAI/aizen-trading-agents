@@ -18,17 +18,21 @@ services:
     schedule: "*/15 * * * *"
     region: oregon
     plan: starter
-    # 5-minute hard cap on each tick. 99% of cycles complete in <30s.
-    # The cap is a safety net so a stuck cycle can't pin the disk.
-    maxRunDuration: 5m
-    disk:
-      name: aizen-data
-      mountPath: /var/data/aizen
-      sizeGB: 1
+    # NOTE: Render cron jobs cannot attach a persistent disk; the
+    # platform hard-cap on each tick is 12 hours. We rely on the
+    # container's own filesystem for the SQLite DB (it lives for
+    # the duration of the tick, gets snapshotted to the
+    # Alpaca-fan-out via cycle_journal in memory). For a
+    # longer-lived store, use a Render Postgres instance
+    # (AIZEN_DB_PATH=postgresql://...) instead of SQLite.
+    # Health check is intentionally omitted: a cron job is not
+    # long-running, so there's nothing for Render to probe.
     envVars:
       # --- Database ---
+      # In-container SQLite by default. Switch to Postgres when
+      # the volume constraint is solved.
       - key: AIZEN_DB_PATH
-        value: /var/data/aizen/trading.db
+        value: /app/data/trading.db
       # --- Alpaca paper trading ---
       # Fill these in from the Render Dashboard with the paper-account keys.
       - key: ALPACA_API_KEY_ID
