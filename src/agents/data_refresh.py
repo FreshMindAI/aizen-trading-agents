@@ -21,8 +21,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
-import pandas as pd
-
 logger = logging.getLogger(__name__)
 
 
@@ -30,11 +28,50 @@ def _alpaca_stock_client():
     """Return an Alpaca historical-data client. Imported lazily so
     tests / dry-runs that don't hit the broker don't pay the import."""
     try:
-        from src.alpaca_client import AlpacaHistoricalClient
-        return AlpacaHistoricalClient()
+        from src.alpaca_client import AlpacaClient
+        return AlpacaClient()
     except Exception as exc:  # noqa: BLE001
         logger.warning("alpaca client import failed: %s", exc)
         return None
+
+
+def _fetch_bars(client, symbol: str, timeframe: str, start: datetime, end: datetime) -> list[dict]:
+    """Hit the v2 stock bars endpoint for one symbol and return a
+    flat list of bar dicts (one per row). Returns an empty list on
+    error or empty response (errors are logged by the client)."""
+    # Alpaca v2 bars API:
+    # GET {data_base_url}/v2/stocks/{symbol}/bars
+    #   ?timeframe=15Min&start=ISO&end=ISO&limit=10000
+    # Pagination: response includes "next_page_token" which we pass
+    # back as `page_token` on the next request.
+    settings = client.settings
+    base = settings.data_base_url.rstrip("/")
+    url = f"{base}/v2/stocks/{symbol}/bars"
+    out: list[dict] = []
+    page_token: str | None = None
+    # Cap at 5 pages of 10k bars each = 50k bars per symbol (way more
+    # than 15-min bars in a hackathon window).
+    for _ in range(5):
+        params: dict[str, str | int] = {
+            "timeframe": timeframe,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "limit": 10000,
+        }
+        if page_token:
+            params["page_token"] = page_token
+        try:
+            payload = client.get(url, params=params)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("alpaca get_bars(%s) failed: %s", symbol, exc)
+            return out
+        if not isinstance(payload, dict):
+            break
+        out.extend(payload.get("bars", []) or [])
+        page_token = payload.get("next_page_token")
+        if not page_token:
+            break
+    return out
 
 
 def refresh_one_bar(
@@ -65,27 +102,23 @@ def refresh_one_bar(
     conn.row_factory = None  # tuple rows are fine for the bulk insert
     try:
         for sym in symbols:
-            try:
-                df = client.get_bars(sym, timeframe=timeframe, start=start, end=end)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("alpaca get_bars(%s) failed: %s", sym, exc)
-                continue
-            if df is None or df.empty:
+            bars = _fetch_bars(client, sym, timeframe, start, end)
+            if not bars:
                 continue
             # Normalize to the underlying_bars schema.
             rows = []
-            for _, r in df.iterrows():
-                ts = r.get("timestamp") or r.name
+            for r in bars:
+                ts = r.get("t") or r.get("timestamp")
                 if hasattr(ts, "isoformat"):
                     ts = ts.isoformat()
                 rows.append((
                     sym,
                     str(ts),
-                    float(r.get("open", 0.0)),
-                    float(r.get("high", 0.0)),
-                    float(r.get("low", 0.0)),
-                    float(r.get("close", 0.0)),
-                    int(r.get("volume", 0)),
+                    float(r.get("o", 0.0)),
+                    float(r.get("h", 0.0)),
+                    float(r.get("l", 0.0)),
+                    float(r.get("c", 0.0)),
+                    int(r.get("v", 0)),
                 ))
             if not rows:
                 continue

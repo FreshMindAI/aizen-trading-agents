@@ -9,14 +9,23 @@ name: Aizen trading cron loop
 #   2. Add repository secrets:
 #        ALPACA_API_KEY_ID
 #        ALPACA_API_SECRET_KEY
-#      (Optional) ANTHROPIC_AUTH_TOKEN — only if you want LLM-backed
-#      reasoning instead of the mock provider.
+#      Optional LLM provider (otherwise the mock provider is used,
+#      which never reaches the network):
+#        ANTHROPIC_AUTH_TOKEN     # required if AIZEN_LLM_PROVIDER=anthropic
+#      Optional HF Hub token (only if a node uses HuggingFace):
+#        HF_TOKEN
 #   3. The Actions tab will start ticking on the cron schedule.
 #      A 15-minute drift is fine; the orchestrator is point-in-time
 #      aware so a late tick just runs against slightly fresher data.
 #
 # Manual trigger:
 #   Actions -> "Aizen trading cron loop" -> "Run workflow" -> Run
+#
+# LLM provider:
+#   Default: AIZEN_LLM_PROVIDER=mock (deterministic, free, no
+#   network). To use the GMI-serving / custom Claude provider, set
+#   AIZEN_LLM_PROVIDER=anthropic + ANTHROPIC_BASE_URL +
+#   ANTHROPIC_MESSAGES_PATH below.
 #
 # Cost:
 #   Public repo, GitHub-hosted runner, ~30-60s per tick.
@@ -49,7 +58,17 @@ jobs:
       # invocation. The live trade journal on Alpaca's side is
       # the source of truth for what happened.
       AIZEN_DB_PATH: ${{ github.workspace }}/data/trading.db
+
+      # ---- LLM provider ----
+      # "mock" never reaches the network (deterministic, free).
+      # "anthropic" routes through whatever ANTHROPIC_BASE_URL is set
+      # to (GMI-serving, or a stock Anthropic endpoint). The base
+      # URL and path are NOT secrets so they live here.
       AIZEN_LLM_PROVIDER: mock
+      # ANTHROPIC_BASE_URL: https://api.gmi-serving.com
+      # ANTHROPIC_MESSAGES_PATH: /v1/messages
+
+      # ---- Loop config ----
       RUN_MODE: paper
       AIZEN_TRACE: '1'
       LOG_LEVEL: INFO
@@ -75,12 +94,11 @@ jobs:
         env:
           ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
           ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
-          # Optional: only set if you want LLM-backed reasoning.
+          # Optional: LLM-backed reasoning (only used when
+          # AIZEN_LLM_PROVIDER=anthropic).
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
-          # If you flip AIZEN_LLM_PROVIDER to "anthropic", also set:
-          # ANTHROPIC_BASE_URL and ANTHROPIC_MESSAGES_PATH as
-          # env vars (they're not secrets so they can live in the
-          # env: block above).
+          # Optional: HF Hub (only if a node uses HuggingFace).
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           mkdir -p data
           python -m src.agents.cli.run_loop --once
