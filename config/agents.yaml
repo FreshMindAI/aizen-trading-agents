@@ -87,3 +87,14 @@ scoring:
     liquidity_penalty: 0.05
     portfolio_risk_penalty: 0.15
   candidate_set_size: 5             # Options Structure Agent returns top-N
+  # Hackathon mandate (Alpaca AI Trading Agents Hackathon, Aug 28 -
+  # Sept 4 2026): options are MANDATORY. When an option candidate is
+  # in the strict DTE window (5-10) AND has a real option_h4 ML
+  # prediction (not the heuristic fallback), add this fixed score
+  # boost so it reliably outscores the parallel long-equity candidate.
+  # Sized to overcome (a) the option leg's spread+liquidity penalties
+  # vs. equity's zero penalties and (b) the option model's
+  # conservative expected_return vs. equity's (dp-0.5)*2 proxy. Set to
+  # 0.0 to disable; the boost is also logged on the candidate's
+  # thesis as `[mandate+0.20]`.
+  option_mandate_boost: 0.20

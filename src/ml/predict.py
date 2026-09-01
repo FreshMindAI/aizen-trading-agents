@@ -80,6 +80,11 @@ SELECT g.contract_symbol, g.symbol, g.timestamp,
        g.is_call, g.days_to_expiry,
        g.strike_price * 1.0 / NULLIF(ub.close, 0)           AS moneyness,
        LN(g.strike_price * 1.0 / NULLIF(ub.close, 0))       AS log_moneyness,
+       -- 27th feature the trained option_h4 artifact expects. Pulled
+       -- from the option bar's raw print volume; LN(0+1) is well-defined
+       -- for zero-volume contracts (matches the impute_median ~1.10
+       -- the artifact carries for this column).
+       LN(NULLIF(g.option_volume, 0) + 1)                   AS option_log_volume,
        fu.{u_cols}
 FROM agg g
 JOIN underlying_bars ub ON ub.symbol = g.symbol AND ub.timestamp = g.timestamp

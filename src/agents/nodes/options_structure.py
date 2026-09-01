@@ -34,6 +34,17 @@ def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
     )
     candidate_size = (config.get("scoring") or {}).get("candidate_set_size", 5)
     candidate_min_score = (config.get("thresholds") or {}).get("candidate_min_score", 0.30)
+    # Hackathon mandate: options are MANDATORY for the Alpaca AI Trading
+    # Agents Hackathon (Aug 28 - Sept 4, 2026). When a valid option
+    # candidate exists (real ML model prediction, in the strict DTE
+    # window, clears the min-score gate), we apply a score boost so it
+    # reliably outscores the parallel long-equity candidate. The boost
+    # is sized to overcome the equity side's score advantage: zero
+    # spread/liquidity penalties (the option leg carries 0.10 + 0.10)
+    # plus the option model's conservative expected_return.
+    option_mandate_boost = float(
+        (config.get("scoring") or {}).get("option_mandate_boost", 0.20)
+    )
 
     def node(state: DecisionState) -> dict[str, Any]:
         snap = state.market_snapshot
@@ -44,6 +55,7 @@ def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
             dte_min=risk_limits.allowed_expiries_dte_min,
             dte_max=risk_limits.allowed_expiries_dte_max,
             gnn_output=state.gnn_output or {},
+            option_mandate_boost=option_mandate_boost,
         )
         # Parallel options+stocks path: build long-equity candidates
         # from the same ML/GNN signal. The supervisor then chooses the
@@ -108,7 +120,8 @@ def _build_candidates(
     snap, weights: ScoringWeights, min_score: float, top_n: int,
     dte_min: int, dte_max: int,
     gnn_output: dict | None = None,
-) -> list[StrategyProposal]:
+    option_mandate_boost: float = 0.0,
+) -> tuple[list[StrategyProposal], str | None]:
     out: list[StrategyProposal] = []
     gnn_features = (gnn_output or {}).get("node_features", {}) or {}
     # Membership is by string symbol; Pydantic UnderlyingScore instances
@@ -184,6 +197,28 @@ def _build_candidates(
             liquidity_penalty=liquidity_penalty,
             portfolio_risk_penalty=portfolio_risk_penalty,
         )
+        # Hackathon mandate: when this option came from a real ML
+        # prediction (model_version starts with the option_h4 artifact
+        # name) AND falls inside the strict DTE window we asked for, add
+        # a fixed boost so it reliably outscores the parallel long-equity
+        # candidate. The boost is NOT applied to heuristic-fallback rows
+        # (model_version = "heuristic-1") — those are placeholder rows
+        # the option ML path produced when its features were unavailable,
+        # and trading them would not exercise the option_h4 model the
+        # way the hackathon rubric expects.
+        model_version = str(opt.model_version or "")
+        is_real_ml = (
+            model_version.startswith("option_h4_")
+            and not model_version.startswith("heuristic")
+        )
+        in_strict_window = dte_min <= dte <= dte_max
+        if option_mandate_boost and is_real_ml and in_strict_window:
+            score = score + option_mandate_boost
+            # Surface the boost on the thesis so the trace shows why
+            # this option outranked the equity leg.
+            proposal = proposal.model_copy(update={
+                "thesis": proposal.thesis + f" [mandate+{option_mandate_boost:.2f}]",
+            })
         proposal = proposal.model_copy(update={"score": score})
         if score >= min_score:
             out.append(proposal)
