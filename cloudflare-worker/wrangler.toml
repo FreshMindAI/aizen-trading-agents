@@ -1,0 +1,40 @@
+# Cloudflare Workers config for the Aizen scheduler.
+# Deploy: npx wrangler deploy
+# Secrets: npx wrangler secret put GITHUB_TOKEN
+#
+# Cron triggers listed here run on Cloudflare's edge network (NOT
+# GitHub's best-effort scheduler). When a trigger fires, the Worker
+# POSTs to the GitHub Actions dispatch API, which queues a
+# workflow_dispatch run. workflow_dispatch runs are reliable and
+# fire immediately on the next available runner.
+
+name = "aizen-scheduler"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+# Cron syntax: 5 fields (minute hour day month weekday). Cloudflare
+# uses standard POSIX cron. We list the same schedules the GitHub
+# workflows had, so the Worker is a drop-in replacement.
+[triggers]
+crons = [
+  # Trade tick: every 15 min on the quarter hour. Replaces the
+  # 0,15,30,45 schedule in cron-loop.yml.
+  "0,15,30,45 * * * *",
+  # Pre-tick news refresh: 5 min before each trade tick.
+  "5,20,35,50 * * * *",
+  # Hourly self-analysis: 7 min past every hour.
+  "7 * * * *",
+  # Daily P&L: 4:30 PM ET = 20:30 UTC, weekdays.
+  "30 20 * * 1-5",
+]
+
+# Worker logs go to Cloudflare's logpush. Set LOG_LEVEL via wrangler:
+#   npx wrangler secret put LOG_LEVEL
+#   value: "info" | "debug"
+#
+# GITHUB_REPO must be set in the wrangler.toml [vars] block (or via
+# `npx wrangler secret put GITHUB_REPO` for full secret treatment).
+# We use [vars] because the repo name is not sensitive.
+[vars]
+GITHUB_REPO = "FreshMindAI/aizen-trading-agents"
+LOG_LEVEL = "info"
