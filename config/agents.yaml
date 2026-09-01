@@ -40,13 +40,22 @@ agents:
 # proxies like GMI-serving (https://api.gmi-serving.com).
 llm:
   provider: mock
-  model: mock-1
+  # `model` is intentionally OMITTED: each provider's class default is the
+  # right answer (MockProvider -> "mock-1", AnthropicProvider ->
+  # ANTHROPIC_DEFAULT_MODEL = "claude-haiku-4-5-20251001", GMIFallbackProvider
+  # inherits the Anthropic default). When AIZEN_LLM_PROVIDER=gmi_fallback
+  # is set in the cron env, leaving `model` unset here ensures the GMI
+  # endpoint receives a real model id, not the MockProvider's "mock-1"
+  # sentinel (which 404s the request).
   temperature: 0.0
   max_tokens: 1024
   timeout_s: 30
   # base_url: https://api.gmi-serving.com
   # messages_path: /v1/messages
   # auth_token_env: ANTHROPIC_AUTH_TOKEN
+  # To pin a specific model, uncomment `model:` and set it to a value
+  # that the resolved provider can actually serve. e.g.:
+  #   model: claude-haiku-4-5-20251001   (for provider: anthropic|gmi_fallback)
 
 # Decision thresholds (doc section 15). A decision is fired only when an ML
 # score crosses these, or a portfolio/regime event crosses the matching gate.

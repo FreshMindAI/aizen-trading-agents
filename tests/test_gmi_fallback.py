@@ -46,6 +46,65 @@ def test_provider_resolves_via_factory() -> None:
     assert p.fallback_token is None  # no env var set in this test
 
 
+def test_gmi_fallback_default_model_is_anthropic_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression pin: when an operator flips AIZEN_LLM_PROVIDER to
+    ``gmi_fallback`` in the cron env, the provider must inherit
+    ANTHROPIC_DEFAULT_MODEL (claude-haiku-4-5-20251001) — NOT the
+    MockProvider's "mock-1" sentinel. The cron workflow does not set
+    ANTHROPIC_MODEL, so any mock-1 leak here would 404 the upstream
+    GMI endpoint. Pin both paths: factory call and bare constructor.
+    """
+    from src.agents.llm import get_provider
+    from src.agents.llm.base import ANTHROPIC_DEFAULT_MODEL
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    p = get_provider("gmi_fallback")
+    assert p.default_model == ANTHROPIC_DEFAULT_MODEL, (
+        f"gmi_fallback inherited {p.default_model!r}, expected "
+        f"{ANTHROPIC_DEFAULT_MODEL!r}. The MockProvider's 'mock-1' "
+        f"must not leak into the gmi_fallback default_model."
+    )
+
+
+def test_gmi_fallback_rejects_mock_sentinel_in_yaml(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Regression pin for the cron-loop 404: when ``config/agents.yaml``
+    sets ``llm.model: mock-1`` (originally written for the MockProvider)
+    and the resolved provider is a real one, the orchestrator must drop
+    the override and use the provider's class default. Without the guard,
+    the gmi_fallback provider would send ``model: mock-1`` to the GMI
+    endpoint and 404.
+    """
+    import sqlite3
+    monkeypatch.setenv("AIZEN_LLM_PROVIDER", "gmi_fallback")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-jwt")
+    # The test runner may inherit an ANTHROPIC_MODEL from the host
+    # environment; we don't care what specific model is selected, only
+    # that the orchestrator's guard drops the mock-only sentinel.
+    # Patch the YAML loader to simulate a stale config.
+    from src.agents import graph as graph_mod
+    monkeypatch.setattr(
+        graph_mod, "get_yaml",
+        lambda *_a, **_kw: {"llm": {
+            "provider": "mock", "model": "mock-1", "timeout_s": 30,
+        }},
+    )
+    from src.agents.graph import Orchestrator
+    c = sqlite3.connect(":memory:")
+    orch = Orchestrator(conn=c, config=None)
+    # The guard must have dropped "mock-1" — assert the *negative*
+    # property (no mock-only sentinel) rather than pinning a specific
+    # model id, since the host environment may set ANTHROPIC_MODEL.
+    assert orch.llm.PROVIDER_NAME == "gmi_fallback"
+    assert orch.llm.default_model not in ("mock-1", None, ""), (
+        f"orchestrator's guard failed to drop the mock-only sentinel; "
+        f"gmi_fallback.default_model={orch.llm.default_model!r} would 404 "
+        f"the upstream endpoint."
+    )
+    assert not str(orch.llm.default_model).startswith("mock-"), (
+        f"gmi_fallback.default_model={orch.llm.default_model!r} starts "
+        f"with 'mock-' — the guard let a mock-only sentinel through."
+    )
+
+
 def test_fallback_token_picked_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "primary-jwt")
     monkeypatch.setenv("GMI_FALLBACK_TOKEN", "fallback-jwt")

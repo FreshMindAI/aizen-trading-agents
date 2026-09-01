@@ -193,9 +193,29 @@ class Orchestrator:
         env_provider = _os.getenv("AIZEN_LLM_PROVIDER") or _os.getenv("LLM_PROVIDER")
         yaml_provider = llm_cfg.get("provider")
         provider_name = (env_provider or yaml_provider or "mock")
+        # Defensive guard: a `model:` field written for the MockProvider
+        # (e.g. "mock-1") leaks into a real provider when an operator
+        # flips the env var. A real provider will then send "mock-1" to
+        # the upstream endpoint and 404 (GMI does not know "mock-1").
+        # The `model` field is opt-in: if a sentinel-only model is set,
+        # drop it and let the provider's class default take over.
+        yaml_model = llm_cfg.get("model")
+        is_real_provider = provider_name in ("anthropic", "gmi_fallback", "gmi",
+                                             "gmi-serving", "openai", "gpt", "oai")
+        looks_like_mock_sentinel = isinstance(yaml_model, str) and (
+            yaml_model.startswith("mock-") or yaml_model.startswith("stub-")
+        )
+        if is_real_provider and looks_like_mock_sentinel:
+            logger.warning(
+                "config/agents.yaml sets llm.model=%r but llm.provider=%r; "
+                "the mock-only sentinel would 404 the upstream. "
+                "Ignoring the override and using the provider's class default.",
+                yaml_model, provider_name,
+            )
+            yaml_model = None
         self.llm = get_provider(
             provider_name,
-            default_model=llm_cfg.get("model"),
+            default_model=yaml_model,
             timeout_s=int(llm_cfg.get("timeout_s", 30)),
         )
 
