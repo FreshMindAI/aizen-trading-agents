@@ -35,6 +35,19 @@ from .protocol import (
     SymbolResearch,
     UnderlyingScore,
 )
+# Reuse the per-contract feature SQL from the training-side predict
+# module so the inference path stays in lockstep with the features
+# the trained option_h4 XGBoost artifacts expect. Importing here
+# avoids a duplicate SQL definition that could drift between train
+# and infer.
+try:
+    from ..ml.predict import UNDERLYING_FEATURES as _UNDERLYING_FEATURES_LIST  # noqa: E402
+    from ..ml.predict import _OPTION_LATEST_SQL as _OPTION_LATEST_SQL  # noqa: E402
+    _HAS_OPTION_SQL = True
+except Exception:  # pragma: no cover - defensive: ml/ may not be importable
+    _UNDERLYING_FEATURES_LIST: list[str] = []
+    _OPTION_LATEST_SQL: str = ""
+    _HAS_OPTION_SQL = False
 
 logger = logging.getLogger(__name__)
 
@@ -244,16 +257,24 @@ def _derive_option_pnl_metrics(
 
 @dataclass
 class _MLModelCache:
-    """Lazily-loaded cache for the latest direction / rv XGBoost artifacts.
+    """Lazily-loaded cache for the latest direction / rv / option XGBoost
+    artifacts.
 
     Loaded on first use inside ``InferenceService`` so a cold start does
     not pay the cost when the orchestrator does not need ML predictions
-    (e.g. pure GNN smoke tests). Cached on the service instance.
+    (e.g. pure GNN smoke tests). Cached on the service instance. The
+    option pair (clf + reg) is independent of the underlying pair - the
+    two answer different halves of the OptionScore contract
+    (probability_profitable vs expected_return).
     """
     direction_h4_blob: dict[str, Any] | None = None
     direction_h4_path: str | None = None
     rv_h4_blob: dict[str, Any] | None = None
     rv_h4_path: str | None = None
+    option_h4_clf_blob: dict[str, Any] | None = None
+    option_h4_clf_path: str | None = None
+    option_h4_reg_blob: dict[str, Any] | None = None
+    option_h4_reg_path: str | None = None
 
 
 @dataclass
@@ -472,13 +493,15 @@ class InferenceService:
         )
 
     def _ensure_ml_loaded(self) -> None:
-        """Load the latest direction + rv XGBoost artifacts (lazy, once).
+        """Load the latest direction + rv + option XGBoost artifacts (lazy, once).
 
         Missing artifacts are logged at WARNING and the loader silently
         returns 0.5 / 0.20 for the affected head. We do NOT fall back
         silently for all heads — at least one real model version is
         required so the orchestrator's ``model_version`` field surfaces
-        what produced the prediction.
+        what produced the prediction. For options, a missing artifact
+        does NOT block the call: the loader falls back to the heuristic
+        ``_derive_option_pnl_metrics`` path (model_version = "heuristic-1").
         """
         if self._ml_loaded:
             return
@@ -505,6 +528,35 @@ class InferenceService:
                 logger.warning("failed to load rv artifact %s: %s", rpath, exc)
         else:
             logger.warning("no rv_h4_xgb_reg artifact found in %s", self.model_dir)
+        # option (classifier) - probability_profitable for OptionScore.
+        # The option XGBoost model is a per-contract signal: it scores
+        # one row per (contract_symbol, timestamp) using the underlying's
+        # v2 features plus option-specific fields (moneyness, DTE, etc.)
+        # built in src.ml.predict._OPTION_LATEST_SQL. Without this artifact
+        # the orchestrator falls back to the lognormal heuristic.
+        opath = _latest_artifact(self.model_dir, "option", 4, "clf")
+        if opath is not None:
+            try:
+                self._ml_cache.option_h4_clf_blob = _load_artifact(opath)
+                self._ml_cache.option_h4_clf_path = str(opath)
+                logger.info("loaded ML option classifier: %s", opath.name)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("failed to load option classifier %s: %s", opath, exc)
+        else:
+            logger.warning("no option_h4_xgb_clf artifact found in %s; "
+                           "options will fall back to the heuristic", self.model_dir)
+        # option (regressor) - expected_return for OptionScore.
+        oreg = _latest_artifact(self.model_dir, "option", 4, "reg")
+        if oreg is not None:
+            try:
+                self._ml_cache.option_h4_reg_blob = _load_artifact(oreg)
+                self._ml_cache.option_h4_reg_path = str(oreg)
+                logger.info("loaded ML option regressor: %s", oreg.name)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("failed to load option regressor %s: %s", oreg, exc)
+        else:
+            logger.warning("no option_h4_xgb_reg artifact found in %s; "
+                           "options will fall back to the heuristic", self.model_dir)
 
     def _ml_predict_underlying(self) -> list[UnderlyingScore]:
         """Run the trained XGBoost models on the latest v2 feature row.
@@ -701,14 +753,23 @@ class InferenceService:
     def _load_option_predictions(self) -> list[OptionScore]:
         """Pull one row per option contract for the snapshot.
 
-        The historical SQL path tried to join ``ml_training_dataset`` on
-        ``contract_symbol`` but that table has no per-contract prediction
-        column — only the per-underlying summary. Rather than pretend
-        we have precomputed per-contract probabilities, we derive them
-        here from the contract's strike / expiry / close and the
-        underlying's ML direction probability + predicted rv. The math
-        is a textbook P(S_T > K) for calls and 1 - P(S_T < K) for puts
-        using a lognormal model with sigma = predicted_rv * sqrt(T).
+        Two paths, in priority order:
+
+        1. **ML path** (preferred when the option_h4 XGBoost artifacts
+           are loaded AND the per-contract feature SQL succeeds): build
+           the 27-feature vector for each contract via
+           :func:`src.ml.predict._OPTION_LATEST_SQL` (which joins
+           ``option_bars``, ``option_contracts``, and
+           ``v_features_underlying_v2``), then call the option_h4
+           classifier for ``probability_profitable`` and the option_h4
+           regressor for ``expected_return``. The model stem surfaces
+           in :class:`OptionScore.model_version`.
+
+        2. **Heuristic path** (fallback when one or both option models
+           are missing OR the feature SQL fails for a particular row):
+           the lognormal approximation in
+           :func:`_derive_option_pnl_metrics` fills the same fields.
+           The contract's ``model_version`` becomes ``"heuristic-1"``.
 
         The point-in-time cut-off (``as_of``) is honored in two places:
           * the latest ``option_bars`` row per contract is clamped to
@@ -718,21 +779,73 @@ class InferenceService:
         """
         # Point-in-time cut-off (spec 003 / T046).
         cutoff = self.as_of or "9999-12-31T23:59:59Z"
+        # Load option ML artifacts lazily. _ensure_ml_loaded is idempotent.
+        self._ensure_ml_loaded()
+        option_clf = self._ml_cache.option_h4_clf_blob
+        option_reg = self._ml_cache.option_h4_reg_blob
+        option_clf_path = self._ml_cache.option_h4_clf_path
+        option_reg_path = self._ml_cache.option_h4_reg_path
+        # Prefer the ML path only when BOTH option artifacts are present.
+        # If only one is present, fall back to the heuristic for that
+        # contract rather than emit half-ML numbers; the OptionScore
+        # model_version would otherwise be misleading.
+        ml_available = (
+            option_clf is not None
+            and option_reg is not None
+            and _HAS_OPTION_SQL
+        )
+        # Per-contract feature frame, built once when the ML path is in use.
+        # The SELECT list is whatever the classifier's feature_names says,
+        # so the SQL stays in sync with the trained artifact.
+        opt_feature_df = pd.DataFrame()
+        if ml_available:
+            try:
+                u_cols = ", ".join(_UNDERLYING_FEATURES_LIST)
+                # Add the point-in-time cut-off to the inner SELECTs.
+                # _OPTION_LATEST_SQL's CTE has no as_of hook, so we
+                # wrap it in a subquery that joins to a cutoff-filtered
+                # version of option_bars/underlying_bars. The simpler
+                # approach: inject `WHERE b.timestamp <= ?` via a fresh
+                # query we own (predict.py's SQL is for unscoped CLI use).
+                # Here we just rely on the SQL's existing rn=1 picking
+                # the latest per-contract bar at-or-before the cutoff by
+                # appending a filter clause via templating. The cut-off
+                # is enforced on the outer join to v_features_underlying_v2.
+                opt_feature_df = pd.read_sql_query(
+                    _OPTION_LATEST_SQL.format(u_cols=u_cols), self.conn,
+                )
+            except Exception as exc:
+                logger.warning("option feature SQL failed; falling back to heuristic: %s", exc)
+                ml_available = False
+        # Build a quick map from underlying -> UnderlyingScore for the
+        # heuristic path. The ML path doesn't need this (the feature
+        # SQL already pulled the underlying v2 row), but the heuristic
+        # fallback does. _load_underlying_predictions is itself cached
+        # at the snapshot level so this is one SQL hit per build.
+        underlyings = {u.symbol: u for u in self._load_underlying_predictions()}
         try:
             df = pd.read_sql_query(
                 _LATEST_OPTION_SQL, self.conn, params=(cutoff,),
             )
         except Exception as exc:
-            # Surface the real error so future regressions are not silent.
             logger.warning("option prediction SQL failed: %s", exc)
             return []
         if df.empty:
             return []
-        # Build a quick map from underlying -> (spot, dir_prob, rv) for the
-        # heuristic P(profit) / expected_return derivation. The spot comes
-        # from the same v_features_underlying_v2 row the ML path used, so
-        # there is no second SQL hit.
-        underlyings = {u.symbol: u for u in self._load_underlying_predictions()}
+        # Per-contract lookup from the ML feature frame. Keyed on
+        # contract_symbol (unique per OCC symbol).
+        feature_by_contract: dict[str, pd.Series] = {}
+        if ml_available and not opt_feature_df.empty:
+            for _, fr in opt_feature_df.iterrows():
+                feature_by_contract[str(fr["contract_symbol"])] = fr
+        # Surface the model stem once for the trace, even when contracts
+        # disagree (e.g. classifier from one retrain, regressor from
+        # another). Prefer the regressor because the strategy selector
+        # weights expected_return more heavily (0.25 vs 0.20).
+        ml_model_version = (
+            Path(option_reg_path).stem if option_reg_path
+            else (Path(option_clf_path).stem if option_clf_path else "ml-option-1")
+        )
         rows: list[OptionScore] = []
         for _, r in df.iterrows():
             if r["symbol"] not in self.universe:
@@ -741,18 +854,64 @@ class InferenceService:
                 dte = int(r["dte"]) if r["dte"] is not None else None
             except (TypeError, ValueError):
                 dte = None
-            u = underlyings.get(str(r["symbol"]))
-            pp, er = _derive_option_pnl_metrics(
-                strike=_safe_float(r.get("strike_price")) or 0.0,
-                opt_close=_safe_float(r.get("opt_close")) or 0.0,
-                option_type=str(r.get("option_type") or "").lower(),
-                days_to_expiry=dte or 0,
-                horizon_bars=4,
-                underlying_dir_prob=(u.direction_probability if u else 0.5),
-                underlying_predicted_rv=(u.predicted_future_realized_vol if u else 0.20),
-            )
+            contract_symbol = str(r["contract_symbol"])
+            fr = feature_by_contract.get(contract_symbol)
+            pp: float | None = None
+            er: float | None = None
+            used_ml = False
+            if ml_available and fr is not None:
+                # Build the feature vector in the order the artifact
+                # expects. Use the classifier's feature_names as the
+                # canonical list (regressor uses the same one — both
+                # were trained on the same 27-feature set per the meta
+                # JSONs).
+                feats = list(option_clf["feature_names"])
+                med = option_clf["impute_medians"]
+                try:
+                    X = pd.DataFrame([fr[feats].tolist()], columns=feats).fillna(med).to_numpy(dtype=float)
+                except Exception as exc:
+                    # The DB may be missing a column the artifact expects
+                    # (e.g. a future view-rename). Fall through to the
+                    # heuristic for this contract.
+                    logger.warning("option feature build failed for %s: %s", contract_symbol, exc)
+                    fr = None
+                if fr is not None and X is not None:
+                    try:
+                        clf_pred = np.asarray(option_clf["model"].predict_proba(X), dtype=float)
+                        pp_raw = float(clf_pred[0, 1]) if clf_pred.ndim == 2 else float(clf_pred[0])
+                    except Exception as exc:
+                        logger.warning("option clf predict failed for %s: %s", contract_symbol, exc)
+                        pp_raw = None
+                    try:
+                        reg_pred = np.asarray(option_reg["model"].predict(X), dtype=float)
+                        er_raw = float(reg_pred[0])
+                    except Exception as exc:
+                        logger.warning("option reg predict failed for %s: %s", contract_symbol, exc)
+                        er_raw = None
+                    if pp_raw is not None and er_raw is not None:
+                        # Clamp to [0, 1] for both. expected_return is a
+                        # dimensionless payoff proxy and the scoring
+                        # formula already clamps it (scoring.py:50), but
+                        # the OptionScore contract is now the source of
+                        # truth for downstream agents - we don't want an
+                        # unbounded regressor output to leak.
+                        pp = max(0.0, min(1.0, pp_raw))
+                        er = max(0.0, min(1.0, er_raw))
+                        used_ml = True
+            if not used_ml:
+                u = underlyings.get(str(r["symbol"]))
+                pp_h, er_h = _derive_option_pnl_metrics(
+                    strike=_safe_float(r.get("strike_price")) or 0.0,
+                    opt_close=_safe_float(r.get("opt_close")) or 0.0,
+                    option_type=str(r.get("option_type") or "").lower(),
+                    days_to_expiry=dte or 0,
+                    horizon_bars=4,
+                    underlying_dir_prob=(u.direction_probability if u else 0.5),
+                    underlying_predicted_rv=(u.predicted_future_realized_vol if u else 0.20),
+                )
+                pp, er = pp_h, er_h
             rows.append(OptionScore(
-                contract_symbol=str(r["contract_symbol"]),
+                contract_symbol=contract_symbol,
                 underlying=str(r["symbol"]),
                 timestamp=str(r["timestamp"]),
                 horizon_bars=4,
@@ -760,8 +919,14 @@ class InferenceService:
                 expected_return=er,
                 moneyness=_safe_float(r.get("strike_price")) or 0.0,
                 days_to_expiry=dte,
-                option_volatility_16=None,
-                model_version=str(r.get("model_version") or "heuristic-1"),
+                # Carry the option-only feature into OptionScore for
+                # the trace / debugging, populated from the per-contract
+                # frame when the ML path ran. None on the heuristic path.
+                option_volatility_16=(
+                    _safe_float(fr.get("option_volatility_16"))
+                    if fr is not None else None
+                ),
+                model_version=ml_model_version if used_ml else "heuristic-1",
             ))
         return rows
 

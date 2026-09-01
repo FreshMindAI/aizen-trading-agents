@@ -83,7 +83,7 @@ def _refresh_data(orch) -> dict[str, int]:
     """
     import json as _json
     from src.agents.alpaca_trading import AlpacaTradingError
-    from src.agents.data_refresh import refresh_one_bar
+    from src.agents.data_refresh import refresh_one_bar, refresh_option_chains
     written: dict[str, int] = {}
     # TIMEFRAME / LOOKBACK_MINUTES / FEED let operators switch the
     # data feed from the cron env without touching code. Default to
@@ -106,6 +106,28 @@ def _refresh_data(orch) -> dict[str, int]:
         logger.warning("Alpaca refresh failed: %s", exc)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Data refresh failed: %s: %s", type(exc).__name__, exc)
+    # Option chain refresh: pulls the last 4h of option bars for the
+    # ATM subset of ``option_contracts`` and upserts into ``option_bars``.
+    # Without this, the option_h4 XGBoost model has no per-contract bar
+    # history to score and the option path falls through to the heuristic
+    # (which then fails the 0.30 candidate_min_score gate). The function
+    # is no-op on broker errors so a broker outage still leaves the
+    # underlying refresh intact.
+    try:
+        opt_written = refresh_option_chains(
+            orch.settings.universe,
+            db_path=_resolve_db_path(),
+            lookback_minutes=lookback,
+            max_contracts_per_symbol=int(os.getenv("OPTION_CHAIN_CAP", "6")),
+            timeframe=timeframe,
+            feed="indicative",  # free tier: 15-min delayed bars are sufficient
+        )
+        if opt_written:
+            logger.info("option bars refreshed: %d contracts, %d rows",
+                        len(opt_written), sum(opt_written.values()))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Option chain refresh failed: %s: %s",
+                       type(exc).__name__, exc)
     return written
 
 
