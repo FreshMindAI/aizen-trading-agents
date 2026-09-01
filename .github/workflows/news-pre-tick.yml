@@ -1,0 +1,70 @@
+name: Aizen news pre-tick refresh
+
+# Fetches the last 15 min of Alpaca news for the 15-symbol universe and
+# rebuilds the news-driven GNN topology snapshot. Runs 5 minutes BEFORE
+# the trade tick (cron-loop.yml fires at :00/:15/:30/:45) so the next
+# trade tick reads the freshest news rows in `gnn_option_graph_snapshots`.
+#
+# This loop intentionally does NOT call `evaluate(market_hours)` — news
+# arrives 24/7 and pre-market articles matter for the next open.
+
+on:
+  schedule:
+    # 5 minutes before each trade tick. We list each minute explicitly
+    # because GitHub's cron doesn't support arithmetic.
+    - cron: '5,20,35,50 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: aizen-news-pre-tick
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: Refresh news + rebuild topology
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    env:
+      AIZEN_DB_PATH: ${{ github.workspace }}/data/trading.db
+      AIZEN_LLM_PROVIDER: mock
+      AIZEN_TRACE: '0'
+      LOG_LEVEL: INFO
+      PYTHONUNBUFFERED: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      # Skip the market-hours gate (news is 24/7).
+      AIZEN_MARKET_HOURS_ONLY: '0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run news pre-tick refresh
+        env:
+          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+        run: |
+          mkdir -p data
+          python -m src.agents.cli.news_pre_tick --lookback-minutes 15
+
+      - name: Upload refreshed snapshot as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: news-pre-tick-${{ github.run_id }}
+          path: data/trading.db
+          if-no-files-found: ignore
+          retention-days: 7

@@ -120,6 +120,67 @@ class AlpacaTradingClient:
     def cancel_order(self, order_id: str) -> dict[str, Any]:
         return self._request("DELETE", f"/v2/orders/{order_id}")
 
+    def list_fills(
+        self,
+        after: str | None = None,
+        until: str | None = None,
+        *,
+        status: str = "filled",
+        limit: int = 500,
+        side: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Page through ``/v2/orders`` and return every order matching
+        the filters.
+
+        ``after`` and ``until`` are RFC-3339 timestamps (e.g. from
+        :func:`src.db.utc_now_iso`). ``side`` is optional and filters
+        on ``buy`` / ``sell`` server-side. We paginate via the
+        ``page_token`` query param; loop terminates when the response
+        is empty or the next page would be empty.
+
+        Used by the daily-P&L loop to grade the previous session's
+        trades.
+        """
+        all_orders: list[dict[str, Any]] = []
+        page_token: str | None = None
+        attempts = 0
+        while len(all_orders) < limit and attempts <= self.max_retries:
+            params: dict[str, Any] = {
+                "status": status,
+                "limit": min(500, limit - len(all_orders)),
+                "direction": "desc",
+            }
+            if after:
+                params["after"] = after
+            if until:
+                params["until"] = until
+            if side:
+                params["side"] = side
+            if page_token:
+                params["page_token"] = page_token
+            qs = "&".join(f"{k}={v}" for k, v in params.items())
+            try:
+                resp = self._request("GET", f"/v2/orders?{qs}")
+            except AlpacaTradingError as exc:
+                logger.warning("alpaca orders fetch failed: %s", exc)
+                return all_orders
+            orders = resp if isinstance(resp, list) else []
+            if not orders:
+                break
+            all_orders.extend(orders)
+            if len(all_orders) >= limit:
+                break
+            # Alpaca's pagination uses a cursor in the response; the
+            # official pattern is to pass `page_token` from the previous
+            # response. If the API didn't return one we're done.
+            page_token = (
+                orders[-1].get("id") if isinstance(orders[-1], dict) else None
+            )
+            if not page_token:
+                break
+            attempts += 1
+        return all_orders[:limit]
+
     def submit_order(self, intent: OrderIntent) -> dict[str, Any]:
         """Convert a multi-leg OrderIntent to one or more broker orders.
 
