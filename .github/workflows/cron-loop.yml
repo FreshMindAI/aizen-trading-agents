@@ -80,12 +80,14 @@ jobs:
       LOG_LEVEL: INFO
       PYTHONUNBUFFERED: '1'
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
-      # 1Hour bars on the free IEX feed (feed=iex) - works on the paper
-      # account. 15Min also works on IEX (verified). The ML models were
-      # trained on h4=1h / h16=4h forward returns, so hourly bars are a
-      # near-perfect match. Set ALPACA_FEED=sip for paid real-time data.
-      TIMEFRAME: '1Hour'
-      LOOKBACK_MINUTES: '480'
+      # 15Min bars on the free IEX feed (feed=iex) - works on the paper
+      # account. The cron ticks on a 15-min cadence, so 15Min bars give
+      # 1 fresh bar per cycle with no overlap. The ML models were
+      # trained on h4=1h / h16=4h forward returns, so a 15Min feed means
+      # each tick reads 4 bars of h1 forward context. Set ALPACA_FEED=sip
+      # for paid real-time data.
+      TIMEFRAME: '15Min'
+      LOOKBACK_MINUTES: '240'   # 16 bars × 15min = 4h of intraday history
       ALPACA_FEED: 'iex'
     steps:
       - name: Checkout

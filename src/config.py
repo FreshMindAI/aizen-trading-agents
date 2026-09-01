@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Load eagerly at import time so every entry point sees the same environment.
 load_dotenv(PROJECT_ROOT / ".env")
 
-DEFAULT_UNIVERSE = "SPY,QQQ,AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,AMD"
+DEFAULT_UNIVERSE = "SPY,QQQ,IWM,DIA,AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,AMD,NFLX,AVGO,COIN"
 
 # Alpaca base hosts. Defaults match the paper environment; YAML overrides.
 DATA_HOST = "https://data.alpaca.markets"

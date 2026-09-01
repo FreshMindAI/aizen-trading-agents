@@ -87,9 +87,11 @@ def _refresh_data(orch) -> dict[str, int]:
     written: dict[str, int] = {}
     # TIMEFRAME / LOOKBACK_MINUTES / FEED let operators switch the
     # data feed from the cron env without touching code. Default to
-    # 1Hour + IEX (works on the free paper account; 15Min + IEX also
-    # works on free). Set FEED=sip if the account is upgraded.
-    timeframe = os.getenv("TIMEFRAME", "1Hour")
+    # 15Min + IEX (works on the free paper account; matches the
+    # 15-min cron cadence so each tick sees 16 fresh 15-min bars
+    # = 4 hours of intraday history). Set FEED=sip if the account
+    # is upgraded.
+    timeframe = os.getenv("TIMEFRAME", "15Min")
     lookback = int(os.getenv("LOOKBACK_MINUTES", "240"))
     feed = os.getenv("ALPACA_FEED", "iex")
     try:
