@@ -27,6 +27,7 @@ from .base import (  # noqa: F401
     ToolSpec,
     get_provider,
 )
+from .gmi_fallback import GMIFallbackProvider  # noqa: F401
 from .telemetry import (  # noqa: F401
     LLMCallAttempt,
     LLMCallTelemetry,

@@ -410,6 +410,9 @@ def get_provider(name: str | None = None, **overrides: Any) -> LLMProvider:
     if resolved in ("anthropic", "claude"):
         from .anthropic_provider import AnthropicProvider
         return AnthropicProvider(**overrides)
+    if resolved in ("gmi_fallback", "gmi", "gmi-serving"):
+        from .gmi_fallback import GMIFallbackProvider
+        return GMIFallbackProvider(**overrides)
     if resolved in ("openai", "gpt", "oai"):
         from .openai_provider import OpenAIProvider
         return OpenAIProvider(**overrides)

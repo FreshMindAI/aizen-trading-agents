@@ -2,18 +2,16 @@ name: Aizen trading cron loop
 
 # Runs `python -m src.agents.cli.run_loop --once` on a 15-minute
 # schedule. This is the GitHub Actions alternative to a Render Cron
-# Job — no payment method required, free for public repos.
+# Job - no payment method required, free for public repos.
 #
 # Setup (one time, in the GitHub repo UI):
 #   1. Settings -> Secrets and variables -> Actions
 #   2. Add repository secrets:
 #        ALPACA_API_KEY_ID
 #        ALPACA_API_SECRET_KEY
-#      Optional LLM provider (otherwise the mock provider is used,
-#      which never reaches the network):
-#        ANTHROPIC_AUTH_TOKEN     # required if AIZEN_LLM_PROVIDER=anthropic
-#      Optional HF Hub token (only if a node uses HuggingFace):
-#        HF_TOKEN
+#        ANTHROPIC_AUTH_TOKEN     # primary GMI JWT
+#        GMI_FALLBACK_TOKEN       # secondary GMI JWT (for bounded retry)
+#        HF_TOKEN                 # HuggingFace read token (downloads models)
 #   3. The Actions tab will start ticking on the cron schedule.
 #      A 15-minute drift is fine; the orchestrator is point-in-time
 #      aware so a late tick just runs against slightly fresher data.
@@ -23,9 +21,16 @@ name: Aizen trading cron loop
 #
 # LLM provider:
 #   Default: AIZEN_LLM_PROVIDER=mock (deterministic, free, no
-#   network). To use the GMI-serving / custom Claude provider, set
-#   AIZEN_LLM_PROVIDER=anthropic + ANTHROPIC_BASE_URL +
-#   ANTHROPIC_MESSAGES_PATH below.
+#   network). To use the GMI-serving provider with primary + fallback
+#   JWTs, set AIZEN_LLM_PROVIDER=gmi_fallback (already set in this
+#   workflow) + ANTHROPIC_BASE_URL=https://api.gmi-serving.com.
+#
+# Model artifacts:
+#   The cron tick downloads the latest ML + GATv2 weights from
+#   HuggingFace dataset `AdithyaByri/aizen-models` (~7MB total) into
+#   ./models/ before each cycle. Without this step the orchestrator
+#   falls back to deterministic dummy signals and every cycle ends
+#   in NO_TRADE.
 #
 # Cost:
 #   Public repo, GitHub-hosted runner, ~30-60s per tick.
@@ -61,12 +66,13 @@ jobs:
 
       # ---- LLM provider ----
       # "mock" never reaches the network (deterministic, free).
-      # "anthropic" routes through whatever ANTHROPIC_BASE_URL is set
-      # to (GMI-serving, or a stock Anthropic endpoint). The base
-      # URL and path are NOT secrets so they live here.
-      AIZEN_LLM_PROVIDER: mock
-      # ANTHROPIC_BASE_URL: https://api.gmi-serving.com
-      # ANTHROPIC_MESSAGES_PATH: /v1/messages
+      # "gmi_fallback" routes through ANTHROPIC_BASE_URL (GMI-serving)
+      # with a single-step fallback swap to GMI_FALLBACK_TOKEN on
+      # 401/403/429. The base URL and path are NOT secrets so they
+      # live here.
+      AIZEN_LLM_PROVIDER: gmi_fallback
+      ANTHROPIC_BASE_URL: https://api.gmi-serving.com
+      ANTHROPIC_MESSAGES_PATH: /v1/messages
 
       # ---- Loop config ----
       RUN_MODE: paper
@@ -89,15 +95,40 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install "huggingface_hub>=0.24"
+
+      - name: Download ML + GATv2 artifacts from HuggingFace
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+          path = snapshot_download(
+              repo_id="AdithyaByri/aizen-models",
+              repo_type="dataset",
+              token=os.environ.get("HF_TOKEN"),
+              allow_patterns=[
+                  "models/*.pkl",
+                  "models/*.pt",
+                  "models/*.meta.json",
+              ],
+              local_dir=os.getcwd(),
+          )
+          print(f"downloaded to {path}")
+          # Quick sanity check: list the artifacts that landed.
+          import pathlib
+          for p in sorted(pathlib.Path("models").glob("*")):
+              if p.is_file() and (p.suffix in {".pkl", ".pt"} or p.suffix == ".json"):
+                  print(f"  {p.name}  {p.stat().st_size} bytes")
+          PY
 
       - name: Run one cycle
         env:
           ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
           ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
-          # Optional: LLM-backed reasoning (only used when
-          # AIZEN_LLM_PROVIDER=anthropic).
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
-          # Optional: HF Hub (only if a node uses HuggingFace).
+          GMI_FALLBACK_TOKEN: ${{ secrets.GMI_FALLBACK_TOKEN }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           mkdir -p data
