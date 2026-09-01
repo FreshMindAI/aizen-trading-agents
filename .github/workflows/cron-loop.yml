@@ -153,3 +153,14 @@ jobs:
               sys.exit(0)  # clean skip, no further work
           "
           python -m src.agents.cli.run_loop --once
+
+      - name: Upload cycle trace as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cycle-trace-${{ github.run_id }}
+          path: |
+            models/cycle_traces/cycle_*.jsonl
+            models/cycle_traces.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
