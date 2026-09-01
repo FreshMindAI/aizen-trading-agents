@@ -35,13 +35,19 @@ def _alpaca_stock_client():
         return None
 
 
-def _fetch_bars(client, symbol: str, timeframe: str, start: datetime, end: datetime) -> list[dict]:
+def _fetch_bars(client, symbol: str, timeframe: str, start: datetime, end: datetime, *, feed: str = "iex") -> list[dict]:
     """Hit the v2 stock bars endpoint for one symbol and return a
     flat list of bar dicts (one per row). Returns an empty list on
-    error or empty response (errors are logged by the client)."""
+    error or empty response (errors are logged by the client).
+
+    `feed` is the Alpaca data subscription: "iex" (free, 15-min delayed
+    intraday) or "sip" (paid, real-time). Default to iex so the free
+    paper account works out of the box; the cron env can override to
+    "sip" if the account is upgraded.
+    """
     # Alpaca v2 bars API:
     # GET {data_base_url}/v2/stocks/{symbol}/bars
-    #   ?timeframe=15Min&start=ISO&end=ISO&limit=10000
+    #   ?timeframe=15Min&start=ISO&end=ISO&limit=10000&feed=iex
     # Pagination: response includes "next_page_token" which we pass
     # back as `page_token` on the next request.
     settings = client.settings
@@ -57,6 +63,7 @@ def _fetch_bars(client, symbol: str, timeframe: str, start: datetime, end: datet
             "start": start.isoformat(),
             "end": end.isoformat(),
             "limit": 10000,
+            "feed": feed,
         }
         if page_token:
             params["page_token"] = page_token
@@ -80,6 +87,7 @@ def refresh_one_bar(
     db_path: Path | str,
     timeframe: str = "1Hour",
     lookback_minutes: int = 60 * 4,  # 4 hours of hourly bars
+    feed: str = "iex",
 ) -> dict[str, int]:
     """Pull the most recent bar for each symbol and upsert into
     ``underlying_bars``. Returns {symbol: n_rows_written}.
@@ -102,7 +110,7 @@ def refresh_one_bar(
     conn.row_factory = None  # tuple rows are fine for the bulk insert
     try:
         for sym in symbols:
-            bars = _fetch_bars(client, sym, timeframe, start, end)
+            bars = _fetch_bars(client, sym, timeframe, start, end, feed=feed)
             if not bars:
                 continue
             # Normalize to the underlying_bars schema.
