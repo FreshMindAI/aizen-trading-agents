@@ -78,8 +78,8 @@ def refresh_one_bar(
     universe: Iterable[str],
     *,
     db_path: Path | str,
-    timeframe: str = "15Min",
-    lookback_minutes: int = 60,
+    timeframe: str = "1Hour",
+    lookback_minutes: int = 60 * 4,  # 4 hours of hourly bars
 ) -> dict[str, int]:
     """Pull the most recent bar for each symbol and upsert into
     ``underlying_bars``. Returns {symbol: n_rows_written}.

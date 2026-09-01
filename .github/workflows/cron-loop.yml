@@ -80,6 +80,11 @@ jobs:
       LOG_LEVEL: INFO
       PYTHONUNBUFFERED: '1'
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      # 1Hour bars (free IEX feed) - 15Min requires paid SIP subscription.
+      # The ML models were trained on h4=1h / h16=4h forward returns, so
+      # hourly bars are a near-perfect match.
+      TIMEFRAME: '1Hour'
+      LOOKBACK_MINUTES: '480'
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -85,8 +85,18 @@ def _refresh_data(orch) -> dict[str, int]:
     from src.agents.alpaca_trading import AlpacaTradingError
     from src.agents.data_refresh import refresh_one_bar
     written: dict[str, int] = {}
+    # TIMEFRAME / LOOKBACK_MINUTES let operators switch the data
+    # feed from the cron env without touching code. Default to
+    # 1Hour (works on the free IEX data feed; 15Min requires SIP).
+    timeframe = os.getenv("TIMEFRAME", "1Hour")
+    lookback = int(os.getenv("LOOKBACK_MINUTES", "240"))
     try:
-        written = refresh_one_bar(orch.settings.universe, db_path=_resolve_db_path())
+        written = refresh_one_bar(
+            orch.settings.universe,
+            db_path=_resolve_db_path(),
+            timeframe=timeframe,
+            lookback_minutes=lookback,
+        )
     except AlpacaTradingError as exc:
         logger.warning("Alpaca refresh failed: %s", exc)
     except Exception as exc:  # noqa: BLE001
