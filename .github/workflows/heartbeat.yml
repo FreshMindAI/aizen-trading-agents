@@ -1,0 +1,115 @@
+name: Aizen scheduler heartbeat
+
+# Self-healing fallback scheduler. Every 5 minutes this workflow
+# determines which Aizen cron window we're currently in (UTC) and
+# fires the matching workflow via the Cloudflare Worker's HTTP
+# endpoint. This is a REDUNDANT scheduler sitting in front of
+# Cloudflare's broken `scheduled()` handler (community-reported
+# outage since 20 June 2026, multiple threads: cron triggers
+# registered but never fire, no errors).
+#
+# Architecture:
+#   GitHub cron (5-min)  ->  Cloudflare Worker (HTTP /?workflow=)
+#                          ->  GitHub dispatch API
+#                          ->  target workflow runs
+#
+# The Worker is a thin proxy here. The only reason it's in the
+# middle is so we can reuse the same GITHUB_TOKEN secret it
+# already has, instead of needing a second secret on this workflow.
+# (We could call the dispatch API directly from this workflow with
+# a second secret, but that doubles the secret-management surface
+# and loses the Worker's existing 204/401/error logging.)
+#
+# Windows (UTC, must match the Worker and the .github/workflows/*.yml
+# files):
+#   00,15,30,45 minutes  -> cron-loop.yml
+#   05,20,35,50 minutes  -> news-pre-tick.yml
+#   07 minutes            -> hourly-analysis.yml
+#   20:30 weekdays        -> daily-pnl.yml
+#
+# Cost: this is one workflow run every 5 min = 288 runs/day, well
+# under the 2,000 min/month free quota at ~10s per run.
+
+on:
+  schedule:
+    # Every 5 minutes on the 5-min boundary.
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: aizen-heartbeat
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  heartbeat:
+    name: Dispatch due workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Determine due workflows (UTC)
+        id: due
+        env:
+          # The Worker URL is public. The Worker holds the GITHUB_TOKEN
+          # as a secret; we only need the URL.
+          WORKER_URL: https://aizen-scheduler.skillcraftstudio999.workers.dev
+        run: |
+          python3 - <<'PY'
+          import os, datetime as dt, json, subprocess, sys, urllib.request, urllib.error
+
+          worker = os.environ["WORKER_URL"]
+          now = dt.datetime.now(dt.timezone.utc)
+          minute = now.minute
+          hour = now.hour
+          weekday = now.weekday()  # 0=Mon ... 6=Sun  (matches our *_1-5  mapping below is 0-based)
+          # Cloudflare cron: weekday 0=Sun, 1=Mon, ..., 6=Sat.
+          # Our daily-pnl cron is `30 20 * * 1-5` (Mon-Fri).
+          cf_weekday = (weekday + 1) % 7  # 0=Sun..6=Sat
+
+          due: list[str] = []
+          if minute in (0, 15, 30, 45):
+              due.append("cron-loop.yml")
+          if minute in (5, 20, 35, 50):
+              due.append("news-pre-tick.yml")
+          if minute == 7:
+              due.append("hourly-analysis.yml")
+          if minute == 30 and hour == 20 and 1 <= cf_weekday <= 5:
+              due.append("daily-pnl.yml")
+
+          print(f"now_utc={now.isoformat()} minute={minute} hour={hour} cf_weekday={cf_weekday}")
+          print(f"due_workflows={due}")
+
+          results = []
+          for wf in due:
+              url = f"{worker}/?workflow={wf}"
+              for attempt in (1, 2):
+                  try:
+                      req = urllib.request.Request(url, method="POST")
+                      with urllib.request.urlopen(req, timeout=15) as r:
+                          status = r.status
+                          body = r.read().decode("utf-8", errors="replace")[:500]
+                  except urllib.error.HTTPError as e:
+                      status = e.code
+                      body = e.read().decode("utf-8", errors="replace")[:500] if e.fp else ""
+                  except Exception as e:
+                      status = -1
+                      body = repr(e)[:500]
+                  print(f"attempt={attempt} workflow={wf} status={status} body={body!r}")
+                  if status == 204:
+                      results.append({"workflow": wf, "status": status})
+                      break
+                  if attempt == 1:
+                      import time; time.sleep(5)
+              else:
+                  results.append({"workflow": wf, "status": status, "error": body})
+          # Surface a non-zero exit if any dispatch failed so the
+          # run shows as failed in the Actions tab (still no retry
+          # of the cron itself - GitHub will run again in 5 min).
+          if any(r.get("status") != 204 for r in results):
+              print("::warning::one or more dispatches failed; see above")
+          with open(os.environ["GITHUB_OUTPUT"], "w") as f:
+              f.write(f"due={json.dumps(due)}\n")
+              f.write(f"results={json.dumps(results)}\n")
+          PY

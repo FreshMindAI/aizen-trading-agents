@@ -2,31 +2,26 @@
 # Deploy: npx wrangler deploy
 # Secrets: npx wrangler secret put GITHUB_TOKEN
 #
-# Cron triggers listed here run on Cloudflare's edge network (NOT
-# GitHub's best-effort scheduler). When a trigger fires, the Worker
-# POSTs to the GitHub Actions dispatch API, which queues a
-# workflow_dispatch run. workflow_dispatch runs are reliable and
-# fire immediately on the next available runner.
+# As of late August 2026 Cloudflare's cron-trigger delivery has been
+# silently failing for many accounts (community reports of triggers
+# registered but never firing, no errors in logs). We have therefore
+# moved scheduling to GitHub Actions: each .github/workflows/*.yml
+# keeps its own `on.schedule:` block, plus .github/workflows/heartbeat.yml
+# fires every 5 min as a redundant backup that POSTs to this Worker's
+# HTTP endpoint. The Worker is now an HTTP-only dispatcher, not a
+# scheduled one.
 
 name = "aizen-scheduler"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 
-# Cron syntax: 5 fields (minute hour day month weekday). Cloudflare
-# uses standard POSIX cron. We list the same schedules the GitHub
-# workflows had, so the Worker is a drop-in replacement.
+# Cron triggers intentionally left empty: scheduling is handled by
+# the GitHub Actions workflows (.github/workflows/*.yml's on.schedule
+# blocks) and the heartbeat workflow (.github/workflows/heartbeat.yml).
+# The [triggers] section is preserved as an empty array so a future
+# re-enable is a one-line uncomment.
 [triggers]
-crons = [
-  # Trade tick: every 15 min on the quarter hour. Replaces the
-  # 0,15,30,45 schedule in cron-loop.yml.
-  "0,15,30,45 * * * *",
-  # Pre-tick news refresh: 5 min before each trade tick.
-  "5,20,35,50 * * * *",
-  # Hourly self-analysis: 7 min past every hour.
-  "7 * * * *",
-  # Daily P&L: 4:30 PM ET = 20:30 UTC, weekdays.
-  "30 20 * * 1-5",
-]
+crons = [ ]
 
 # Worker logs go to Cloudflare's logpush. Set LOG_LEVEL via wrangler:
 #   npx wrangler secret put LOG_LEVEL
