@@ -132,4 +132,15 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           mkdir -p data
+          # Fast gate before the cycle runs: outside US equity hours
+          # (9:30-16:00 ET, weekdays, no holidays) the data refresh
+          # 403s and there's nothing for the orchestrator to do.
+          python -c "
+          from src.agents.market_hours import evaluate
+          g = evaluate()
+          print(f'market-hours gate: {g}')
+          if not g.should_run:
+              import sys
+              sys.exit(0)  # clean skip, no further work
+          "
           python -m src.agents.cli.run_loop --once

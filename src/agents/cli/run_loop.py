@@ -126,6 +126,22 @@ def run_once() -> int:
     """Run a single cycle. Returns process exit code."""
     started = _now_iso()
     started_epoch = time.time()
+
+    # Market-hours gate. The cron job ticks 24/7 but Alpaca's data
+    # feed + GMI are wasted outside US equity hours (and 403s the
+    # bar pull on some paper accounts). Skip the cycle cleanly with
+    # exit 0 so Render / GitHub Actions record a successful no-op.
+    from src.agents.market_hours import evaluate as _market_hours_evaluate
+    gate = _market_hours_evaluate()
+    if not gate.should_run:
+        print(f"== run_loop summary ==")
+        print(f"  started_at    : {started}")
+        print(f"  duration_s    : {round(time.time() - started_epoch, 2)}")
+        print(f"  final_action  : SKIP (market closed)")
+        print(f"  reason        : {gate.reason}")
+        print(f"  now_et        : {gate.now_et.isoformat()}")
+        return 0
+
     from src.agents.graph import Orchestrator
     from src.db import connect, init_db
 

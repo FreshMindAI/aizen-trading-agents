@@ -48,3 +48,4 @@ reports/
 models/ablation_*.json
 models/backtest_*.json
 models/cycle_traces/
+models/cycle_traces.jsonl
