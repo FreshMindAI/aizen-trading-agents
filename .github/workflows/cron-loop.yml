@@ -154,6 +154,24 @@ jobs:
           "
           python -m src.agents.cli.run_loop --once
 
+      # Bug B fix: the GH Actions runner is ephemeral so the local
+      # decision_journal is wiped on every invocation. After each
+      # cycle, push the journal rows to a HuggingFace dataset so
+      # the decisions survive runner shutdown.
+      #
+      # Content scope: the script redacts agent_observations_json
+      # and agent_messages_json (LLM prompt/response envelopes) by
+      # default - only the trading-signal JSON blobs go up. The
+      # script is no-op if no new decisions have been recorded
+      # since the last upload (server-side dedup via the merged
+      # snapshot.jsonl).
+      - name: Push decision journal to HuggingFace
+        if: always()
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python scripts/push_journal_to_hf.py || echo "journal upload failed (non-fatal)"
+
       - name: Upload cycle trace as artifact
         if: always()
         uses: actions/upload-artifact@v4
