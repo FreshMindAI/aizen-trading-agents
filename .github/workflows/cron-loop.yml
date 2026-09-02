@@ -170,7 +170,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python scripts/push_journal_to_hf.py || echo "journal upload failed (non-fatal)"
+          python scripts/push_journal_to_hf.py --include-llm-transcripts || echo "journal upload failed (non-fatal)"
 
       - name: Upload cycle trace as artifact
         if: always()
