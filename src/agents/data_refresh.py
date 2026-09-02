@@ -183,24 +183,38 @@ def _alpaca_data_client():
 def _pick_atm_contracts(conn: sqlite3.Connection, symbol: str,
                         spot: float, max_contracts: int = 6,
                         max_dte: int = 45) -> list[str]:
-    """Pick up to ``max_contracts`` ATM call contracts for ``symbol``
-    from ``option_contracts`` whose DTE is within ``[1, max_dte]``.
+    """Pick up to ``max_contracts`` ATM contracts (calls AND puts) for
+    ``symbol`` from ``option_contracts`` whose DTE is within
+    ``[1, max_dte]``.
 
-    Ranking: prefer nearest expiry first, then closest strike to spot,
-    then alphabetical. The list is bounded so a single symbol's full
+    Bug C fix: the previous version filtered on
+    ``option_type = 'call'`` only, so the put side of the chain
+    never had live bars and the option_h4 model would score them
+    with a stale (or empty) bar history. Both calls and puts are
+    equally important - a long-put strategy on META needs the
+    ``META260902P00572500`` bar series, not just the call side.
+
+    Ranking: the order matters because ``LIMIT max_contracts``
+    will otherwise grab all-calls (sorted alphabetically) on the
+    earliest expiry and starve the put side. We sort by ATM
+    distance first so the result naturally balances calls and
+    puts at the nearest strikes, with nearest-expiry as a
+    tiebreaker. The list is bounded so a single symbol's full
     chain doesn't fan out to hundreds of HTTP calls.
     """
     rows = conn.execute(
         """
         SELECT contract_symbol,
+               option_type,
                CAST(julianday(expiration_date) - julianday('now') AS INTEGER) AS dte
         FROM   option_contracts
         WHERE  underlying_symbol = ?
-          AND  option_type = 'call'
+          AND  option_type IN ('call', 'put')
           AND  tradable = 1
-          AND  status = 'active'
           AND  CAST(julianday(expiration_date) - julianday('now') AS INTEGER) BETWEEN 1 AND ?
-        ORDER BY expiration_date ASC, ABS(strike_price - ?) ASC
+        ORDER BY ABS(strike_price - ?) ASC,
+                 expiration_date ASC,
+                 option_type ASC
         LIMIT  ?
         """,
         (symbol, max_dte, spot, max_contracts),
@@ -233,6 +247,7 @@ def refresh_option_chains(
         return {}
     client = _alpaca_data_client()
     if client is None:
+        logger.warning("refresh_option_chains: no alpaca client, returning empty")
         return {}
     # Data host for historical option bars (matches the existing
     # download_option_bars.py wiring). The function deliberately does
@@ -254,6 +269,8 @@ def refresh_option_chains(
     conn = sqlite3.connect(p)
     conn.row_factory = sqlite3.Row
     written: dict[str, int] = {}
+    contracts_picked = 0
+    broker_calls = 0
     try:
         for sym in symbols:
             spot_row = conn.execute(
@@ -272,6 +289,7 @@ def refresh_option_chains(
             if not contracts:
                 logger.debug("refresh_option_chains: no contracts in option_contracts for %s", sym)
                 continue
+            contracts_picked += len(contracts)
             # Chunk to honor the 100-symbols-per-request cap that the
             # options-bars endpoint documents.
             chunk_size = 100
@@ -291,8 +309,10 @@ def refresh_option_chains(
                         if page_token:
                             params["page_token"] = page_token
                         payload = client.get(url, params=params)
+                        broker_calls += 1
                         if not isinstance(payload, dict):
                             break
+                        bars_in_page = 0
                         for csym, bar in _iter_option_bars(payload):
                             ts = _bar_ts(bar)
                             if not ts or not csym:
@@ -316,10 +336,20 @@ def refresh_option_chains(
                                     ),
                                 )
                                 written[csym] = written.get(csym, 0) + 1
+                                bars_in_page += 1
                             except sqlite3.OperationalError as exc:
                                 logger.warning(
                                     "option_bars upsert for %s failed: %s", csym, exc,
                                 )
+                        if bars_in_page == 0:
+                            # The endpoint returned 200 OK with no bars
+                            # for these contracts. Don't keep paginating
+                            # - log and move on.
+                            logger.debug(
+                                "refresh_option_chains: 0 bars returned for %s chunk %s",
+                                sym, chunk[:3],
+                            )
+                            break
                         page_token = payload.get("next_page_token")
                         if not page_token:
                             break
@@ -328,6 +358,17 @@ def refresh_option_chains(
                     logger.warning("alpaca options bars for %s failed: %s", sym, exc)
                     continue
     finally:
+        # Bug C fix: structured summary at INFO level so the cron log
+        # shows whether the refresh actually wrote anything. Without
+        # this, a silent failure (broker returned 200 OK with empty
+        # bars, or no ATM contracts match the 1-45 DTE filter) looks
+        # identical to a successful refresh.
+        logger.info(
+            "refresh_option_chains summary: universe=%d, contracts_picked=%d, "
+            "broker_calls=%d, rows_written=%d, n_contracts_with_bars=%d",
+            len(symbols), contracts_picked, broker_calls,
+            sum(written.values()), len(written),
+        )
         conn.close()
     return written
 

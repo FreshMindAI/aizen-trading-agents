@@ -170,7 +170,18 @@ def _build_candidates(
             quantity=1,
             option_type=OptionType.CALL if "C" in opt.contract_symbol else OptionType.PUT,
             strike=_strike_from_symbol(opt.contract_symbol),
-            expiry=opt.timestamp[:10] if opt.timestamp else "2099-12-31",
+            # Bug A fix: Leg.expiry must be the contract's actual
+            # expiration_date, NOT the latest option_bars.timestamp.
+            # Using the bar's date (often days older than the live
+            # bar refresh cadence) produces a Leg with a past expiry,
+            # which the broker rejects. Fall back to the OCC symbol's
+            # encoded expiry if the inference layer didn't propagate
+            # expiration_date, then to a far-future default.
+            expiry=(
+                opt.expiration_date
+                or _expiry_from_occ_symbol(opt.contract_symbol)
+                or "2099-12-31"
+            ),
         )
         proposal = StrategyProposal(
             underlying=underlying,
@@ -186,7 +197,9 @@ def _build_candidates(
             confidence=float(opt.probability_profitable or 0.0),
             max_loss=float(max(1.0, (opt.expected_return or 0.0) * 200.0 + 100.0)),
             liquidity_metrics={"option_volatility_16": float(opt.option_volatility_16 or 0.0)},
-            expiry=opt.timestamp[:10] if opt.timestamp else "2099-12-31",
+            # StrategyProposal.expiry is the longest leg's expiry; for
+            # a single-leg call/put, that's just this leg's expiry.
+            expiry=leg.expiry,
         )
         score = score_candidate(
             proposal, weights,
@@ -421,3 +434,32 @@ def _strike_from_symbol(symbol: str) -> float:
         return float(int(symbol[-8:])) / 1000.0
     except (ValueError, IndexError):
         return 0.0
+
+
+def _expiry_from_occ_symbol(symbol: str) -> str | None:
+    """Decode the 6-digit YYMMDD expiry code from an OCC option symbol.
+
+    OCC symbols have the form ``TICKER + YYMMDD + C/P + 8-digit-strike``,
+    e.g. ``META260902C00572500`` -> expiry ``2026-09-02``. Used as a
+    defense-in-depth fallback when the inference layer didn't
+    propagate ``option_contracts.expiration_date`` to the
+    OptionScore. Returns None on any parse failure rather than a
+    fabricated date - the Leg builder falls through to its "2099-12-31"
+    far-future default in that case.
+    """
+    if len(symbol) < 15:
+        return None
+    code = symbol[-15:-9]   # 6 digits: YYMMDD
+    if not code.isdigit():
+        return None
+    try:
+        from datetime import date
+        yy, mm, dd = int(code[0:2]), int(code[2:4]), int(code[4:6])
+        # OCC uses a rolling 50-year window. For YYMMDD < 70 (i.e.
+        # 2000-2069) we map to 20YY; for 70-99 (2070-2099) we map
+        # to 19YY. Today's hackathon window is 2026 so we use 20YY
+        # unconditionally.
+        year = 2000 + yy
+        return date(year, mm, dd).isoformat()
+    except (ValueError, IndexError):
+        return None

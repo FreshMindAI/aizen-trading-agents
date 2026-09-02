@@ -927,6 +927,12 @@ class InferenceService:
                     if fr is not None else None
                 ),
                 model_version=ml_model_version if used_ml else "heuristic-1",
+                # Bug A fix: the contract's actual expiration_date
+                # (from option_contracts.expiration_date) MUST be
+                # propagated so the Leg builder uses the real expiry,
+                # not the latest bar's date. Brokers reject orders
+                # whose Leg.expiry is in the past.
+                expiration_date=str(r.get("expiration_date") or "") or None,
             ))
         return rows
 

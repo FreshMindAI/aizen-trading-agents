@@ -122,6 +122,15 @@ class OptionScore(StrictModel):
     days_to_expiry: int | None = None
     option_volatility_16: float | None = None
     model_version: str | None = None
+    # Contract's actual expiration date (YYYY-MM-DD) as encoded in
+    # ``option_contracts.expiration_date`` (and recoverable from the
+    # OCC symbol's 6-digit expiry code). Distinct from ``timestamp``
+    # (the latest bar's date) and from ``days_to_expiry`` (an int).
+    # The Leg builder MUST use this field for ``expiry``, not the
+    # bar's ``timestamp`` - using the bar's date means the Leg's
+    # expiry is anchored on a stale bar and brokers reject the
+    # order with "past expiry".
+    expiration_date: str | None = None
 
 
 class PortfolioPosition(StrictModel):
