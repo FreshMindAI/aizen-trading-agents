@@ -94,7 +94,11 @@ scoring:
   # boost so it reliably outscores the parallel long-equity candidate.
   # Sized to overcome (a) the option leg's spread+liquidity penalties
   # vs. equity's zero penalties and (b) the option model's
-  # conservative expected_return vs. equity's (dp-0.5)*2 proxy. Set to
-  # 0.0 to disable; the boost is also logged on the candidate's
-  # thesis as `[mandate+0.20]`.
-  option_mandate_boost: 0.20
+  # conservative expected_return vs. equity's (dp-0.5)*2 proxy. The
+  # default 0.30 is enough to outscore a typical equity candidate
+  # (~0.30-0.35) by 0.05+ so the supervisor reliably picks the option
+  # leg in a strict DTE window. Set to 0.0 to disable; the boost is
+  # also logged on the candidate's thesis as `[mandate+0.30]`. The
+  # cloud cron can override this at runtime via the
+  # AIZEN_OPTION_MANDATE_BOOST env var without editing this file.
+  option_mandate_boost: 0.30

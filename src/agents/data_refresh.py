@@ -249,22 +249,21 @@ def refresh_option_chains(
     if client is None:
         logger.warning("refresh_option_chains: no alpaca client, returning empty")
         return {}
-    # Data host for historical option bars (matches the existing
-    # download_option_bars.py wiring). The function deliberately does
-    # NOT add an OPRA-signed header - free accounts get the delayed
-    # ``indicative`` feed which is sufficient for the option_h4 model
-    # (4-bar horizon, called every 15 min).
+    # Data host. We deliberately use ``/v1beta1/options/snapshots``
+    # (NOT ``/v1beta1/options/bars``) because the bars endpoint
+    # requires an OPRA agreement on Alpaca (free paper accounts get
+    # HTTP 403 "OPRA agreement is not signed"). The snapshots endpoint
+    # serves the same daily OHLCV bar for the current session on the
+    # data host without an OPRA subscription, which is what the
+    # option_h4 XGBoost model needs to build its per-contract feature
+    # vector. We write the snapshot's ``dailyBar`` to ``option_bars``
+    # as a single row per contract (the option_h4 feature builder
+    # takes the LAST bar per contract via
+    # ``ROW_NUMBER() OVER (PARTITION BY contract_symbol ORDER BY
+    # timestamp DESC)`` so one fresh row per tick is sufficient).
     from src.config import DATA_HOST
     base = DATA_HOST.rstrip("/")
-    url = f"{base}/v1beta1/options/bars"
-    # Look back ``lookback_minutes`` from now. The endpoint clamps to
-    # fully-past bars on the free tier; this is fine because the cron
-    # tick only needs the most recent row per contract for the
-    # option_h4 feature builder (which uses the LAST bar via
-    # ``ROW_NUMBER() OVER (PARTITION BY contract_symbol ORDER BY
-    # timestamp DESC)``).
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=lookback_minutes)
+    url = f"{base}/v1beta1/options/snapshots"
     p = Path(db_path)
     conn = sqlite3.connect(p)
     conn.row_factory = sqlite3.Row
@@ -282,6 +281,25 @@ def refresh_option_chains(
                 logger.debug("refresh_option_chains: no spot for %s, skipping", sym)
                 continue
             spot = float(spot_row["s"])
+            # Re-stamp the option bar to the latest underlying_bars
+            # timestamp for this symbol. The snapshot endpoint returns
+            # the daily bar with a fixed UTC-midnight-style timestamp
+            # (e.g. ``2026-09-02T04:00:00Z``) but ``underlying_bars``
+            # are stamped at the 15Min cadence during the trading
+            # session (e.g. ``2026-09-02T15:30:00Z``). The
+            # ``_OPTION_LATEST_SQL`` in src/ml/predict.py joins on
+            # ``ub.timestamp = g.timestamp`` and would otherwise return
+            # 0 rows, leaving the option_h4 XGBoost model without
+            # features and forcing every contract to fall through to
+            # ``model_version = "heuristic-1"``. We re-stamp to the
+            # underlying's latest timestamp so the join succeeds and
+            # the real ML path runs.
+            ub_ts_row = conn.execute(
+                "SELECT timestamp AS t FROM underlying_bars WHERE symbol=? "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (sym,),
+            ).fetchone()
+            aligned_ts = ub_ts_row["t"] if ub_ts_row else None
             contracts = _pick_atm_contracts(
                 conn, sym, spot,
                 max_contracts=max_contracts_per_symbol, max_dte=max_dte,
@@ -290,72 +308,68 @@ def refresh_option_chains(
                 logger.debug("refresh_option_chains: no contracts in option_contracts for %s", sym)
                 continue
             contracts_picked += len(contracts)
-            # Chunk to honor the 100-symbols-per-request cap that the
-            # options-bars endpoint documents.
+            # Chunk to honor the ~100-symbols-per-request cap that the
+            # snapshots endpoint accepts.
             chunk_size = 100
             for i in range(0, len(contracts), chunk_size):
                 chunk = contracts[i : i + chunk_size]
-                params: dict[str, str | int] = {
+                params: dict[str, str] = {
                     "symbols": ",".join(chunk),
-                    "timeframe": timeframe,
-                    "start": start.isoformat(),
-                    "end": end.isoformat(),
-                    "limit": 10000,
-                    "feed": feed,
                 }
                 try:
-                    page_token: str | None = None
-                    for _ in range(5):
-                        if page_token:
-                            params["page_token"] = page_token
-                        payload = client.get(url, params=params)
-                        broker_calls += 1
-                        if not isinstance(payload, dict):
-                            break
-                        bars_in_page = 0
-                        for csym, bar in _iter_option_bars(payload):
-                            ts = _bar_ts(bar)
-                            if not ts or not csym:
-                                continue
-                            try:
-                                conn.execute(
-                                    "INSERT OR REPLACE INTO option_bars "
-                                    "(contract_symbol, timestamp, open, high, low, close, "
-                                    " volume, vwap, trade_count, feed) "
-                                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                    (
-                                        csym, ts,
-                                        _bar_float(bar, "o", "open"),
-                                        _bar_float(bar, "h", "high"),
-                                        _bar_float(bar, "l", "low"),
-                                        _bar_float(bar, "c", "close"),
-                                        _bar_int(bar, "v", "volume"),
-                                        _bar_float(bar, "vw", "vwap"),
-                                        _bar_int(bar, "n", "trade_count"),
-                                        feed,
-                                    ),
-                                )
-                                written[csym] = written.get(csym, 0) + 1
-                                bars_in_page += 1
-                            except sqlite3.OperationalError as exc:
-                                logger.warning(
-                                    "option_bars upsert for %s failed: %s", csym, exc,
-                                )
-                        if bars_in_page == 0:
-                            # The endpoint returned 200 OK with no bars
-                            # for these contracts. Don't keep paginating
-                            # - log and move on.
-                            logger.debug(
-                                "refresh_option_chains: 0 bars returned for %s chunk %s",
-                                sym, chunk[:3],
+                    payload = client.get(url, params=params)
+                    broker_calls += 1
+                    if not isinstance(payload, dict):
+                        break
+                    snapshots = payload.get("snapshots") or {}
+                    bars_in_page = 0
+                    for csym, snap in snapshots.items():
+                        if not isinstance(snap, dict):
+                            continue
+                        daily = snap.get("dailyBar") or snap.get("minuteBar")
+                        if not isinstance(daily, dict):
+                            continue
+                        raw_ts = _bar_ts(daily)
+                        if not raw_ts:
+                            continue
+                        # Use the underlying-aligned timestamp when
+                        # available so the option_bars.underlying_bars
+                        # join in _OPTION_LATEST_SQL succeeds.
+                        ts = aligned_ts or raw_ts
+                        try:
+                            conn.execute(
+                                "INSERT OR REPLACE INTO option_bars "
+                                "(contract_symbol, timestamp, open, high, low, close, "
+                                " volume, vwap, trade_count, feed) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                (
+                                    csym, ts,
+                                    _bar_float(daily, "o", "open"),
+                                    _bar_float(daily, "h", "high"),
+                                    _bar_float(daily, "l", "low"),
+                                    _bar_float(daily, "c", "close"),
+                                    _bar_int(daily, "v", "volume"),
+                                    _bar_float(daily, "vw", "vwap"),
+                                    _bar_int(daily, "n", "trade_count"),
+                                    "indicative",
+                                ),
                             )
-                            break
-                        page_token = payload.get("next_page_token")
-                        if not page_token:
-                            break
+                            written[csym] = written.get(csym, 0) + 1
+                            bars_in_page += 1
+                        except sqlite3.OperationalError as exc:
+                            logger.warning(
+                                "option_bars upsert for %s failed: %s", csym, exc,
+                            )
+                    if bars_in_page == 0:
+                        # 200 OK with no snapshots for these contracts.
+                        # Don't retry - move on.
+                        logger.debug(
+                            "refresh_option_chains: 0 snapshots returned for %s chunk %s",
+                            sym, chunk[:3],
+                        )
                     conn.commit()
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("alpaca options bars for %s failed: %s", sym, exc)
+                    logger.warning("alpaca options snapshots for %s failed: %s", sym, exc)
                     continue
     finally:
         # Bug C fix: structured summary at INFO level so the cron log
@@ -368,6 +382,173 @@ def refresh_option_chains(
             "broker_calls=%d, rows_written=%d, n_contracts_with_bars=%d",
             len(symbols), contracts_picked, broker_calls,
             sum(written.values()), len(written),
+        )
+        conn.close()
+    return written
+
+
+# ---- Option contracts refresh (live tick) -------------------------------
+# Bug: on the cloud cron the runner is ephemeral - the SQLite DB is
+# wiped on every invocation, which means ``option_contracts`` is empty
+# at the start of each tick. ``refresh_option_chains`` only READS from
+# ``option_contracts`` to pick the ATM subset, so it returns ``{}``
+# every cloud cycle, ``option_bars`` stays empty, and the option_h4
+# XGBoost model has no per-contract bar history to score. The cycle
+# then falls through to equity-only and the user's hackathon mandate
+# ("trade options, not just stocks") is silently unmet.
+#
+# Fix: ``populate_option_contracts`` runs at the TOP of every cron
+# tick and re-fetches the option chain from
+# ``PAPER_HOST/v2/options/contracts`` for each underlying, bounded by
+# a 1-30 DTE window and a +/-10% strike band. This mirrors
+# ``src.download_option_contracts.py:main`` (the historical one-shot
+# downloader) but is a function (not a CLI) and is silent on broker
+# errors. The contract set is small (<= 100 rows per symbol) so the
+# network cost per tick is ~1 HTTP call per underlying.
+#
+# ``refresh_option_chains`` then has a non-empty ``option_contracts``
+# table to read, populates ``option_bars`` for the ATM subset, and
+# the option_h4 model can score the contracts on this tick.
+def _fetch_option_contracts(client, symbol: str, spot: float,
+                            *, min_dte: int, max_dte: int,
+                            band_pct: float) -> list[tuple]:
+    """Hit ``PAPER_HOST/v2/options/contracts`` for one symbol and
+    return rows ready to upsert into ``option_contracts``.
+
+    The API takes ``expiration_date_gte`` / ``expiration_date_lte``
+    as ISO date strings and ``strike_price_gte`` / ``strike_price_lte``
+    as numerics. We bound the strike band to +/-10% of the latest
+    stored spot (mirroring the ``download_option_contracts`` default)
+    so we don't pull a thousand OTM contracts per symbol.
+
+    Returns a list of tuples in the column order of the
+    ``option_contracts`` table.
+    """
+    from datetime import date, timedelta
+    from src.config import PAPER_HOST
+    base = PAPER_HOST.rstrip("/")
+    url = f"{base}/v2/options/contracts"
+    lo = round(spot * (1 - band_pct), 2)
+    hi = round(spot * (1 + band_pct), 2)
+    min_exp = (date.today() + timedelta(days=min_dte)).isoformat()
+    max_exp = (date.today() + timedelta(days=max_dte)).isoformat()
+    params: dict = {
+        "underlying_symbols": symbol,
+        "status": "active",
+        "expiration_date_gte": min_exp,
+        "expiration_date_lte": max_exp,
+        "strike_price_gte": lo,
+        "strike_price_lte": hi,
+        "limit": 10000,
+    }
+    rows: list[tuple] = []
+    seen: set[str] = set()
+    try:
+        for payload in client.paginate(url, params):
+            contracts = payload.get("option_contracts") or payload.get("contracts") or []
+            if not isinstance(contracts, list):
+                continue
+            for c in contracts:
+                if not isinstance(c, dict):
+                    continue
+                sym = c.get("symbol")
+                if not sym or sym in seen:
+                    continue
+                seen.add(sym)
+                rows.append((
+                    sym,
+                    c.get("id"),
+                    c.get("underlying_symbol") or symbol,
+                    c.get("expiration_date"),
+                    c.get("strike_price"),
+                    c.get("type"),
+                    c.get("style"),
+                    c.get("status"),
+                    1 if c.get("tradable") else 0,
+                    c.get("root_symbol"),
+                    datetime.now(timezone.utc).isoformat(),
+                ))
+    except Exception as exc:  # noqa: BLE001
+        # Treat any per-symbol broker failure as a no-op for that
+        # symbol. The cron tick should not fail because one underlying
+        # hit a 5xx.
+        logger.warning("populate_option_contracts: %s failed: %s", symbol, exc)
+        return []
+    return rows
+
+
+def populate_option_contracts(
+    universe: Iterable[str],
+    *,
+    db_path: Path | str,
+    min_dte: int = 1,
+    max_dte: int = 30,
+    band_pct: float = 0.10,
+) -> dict[str, int]:
+    """Populate ``option_contracts`` for every symbol in the universe
+    with the 1-30 DTE, +/-10% strike-band subset of the chain.
+
+    Returns ``{symbol: n_contracts_upserted}``. Silent on broker
+    errors: returns ``{}`` if Alpaca is unreachable, and logs
+    per-symbol warnings for any 5xx/timeout. The function is the
+    live-tick analog of ``src.download_option_contracts.py`` -
+    designed to be called on every cron tick so the option ML
+    model has a non-empty contract list to score, even on the
+    ephemeral GitHub Actions runner where the DB is wiped on
+    every invocation.
+    """
+    symbols = [s for s in universe if s]
+    if not symbols:
+        return {}
+    client = _alpaca_data_client()
+    if client is None:
+        logger.warning("populate_option_contracts: no alpaca client, returning empty")
+        return {}
+    p = Path(db_path)
+    conn = sqlite3.connect(p)
+    conn.row_factory = sqlite3.Row
+    written: dict[str, int] = {}
+    contracts_by_type: dict[str, int] = {}
+    try:
+        for sym in symbols:
+            spot_row = conn.execute(
+                "SELECT close AS s FROM underlying_bars WHERE symbol=? "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (sym,),
+            ).fetchone()
+            if spot_row is None or spot_row["s"] is None:
+                logger.debug("populate_option_contracts: no spot for %s, skipping", sym)
+                continue
+            spot = float(spot_row["s"])
+            rows = _fetch_option_contracts(
+                client, sym, spot,
+                min_dte=min_dte, max_dte=max_dte, band_pct=band_pct,
+            )
+            if not rows:
+                continue
+            try:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO option_contracts "
+                    "(contract_symbol, contract_id, underlying_symbol, "
+                    " expiration_date, strike_price, option_type, style, "
+                    " status, tradable, root_symbol, fetched_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+                conn.commit()
+                written[sym] = len(rows)
+                # Track the type balance so a one-sided chain (calls
+                # only or puts only) is visible in the cron log.
+                for r in rows:
+                    t = r[5] or "unknown"
+                    contracts_by_type[t] = contracts_by_type.get(t, 0) + 1
+            except sqlite3.OperationalError as exc:
+                logger.warning("option_contracts upsert for %s failed: %s", sym, exc)
+    finally:
+        logger.info(
+            "populate_option_contracts summary: universe=%d, contracts=%d, "
+            "by_type=%s",
+            len(symbols), sum(written.values()), contracts_by_type,
         )
         conn.close()
     return written

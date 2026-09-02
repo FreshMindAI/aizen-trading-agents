@@ -168,7 +168,11 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python scripts/push_journal_to_hf.py --include-llm-transcripts || echo "journal upload failed (non-fatal)"
+          # Fail loud (no '|| echo'): a failed upload shows as a
+          # failed step in the run summary so the user notices.
+          # The next step has 'if: always()' so the cycle trace
+          # still uploads even when this fails.
+          python scripts/push_journal_to_hf.py --include-llm-transcripts
 
       - name: Upload cycle trace as artifact
         if: always()

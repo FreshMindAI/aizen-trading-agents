@@ -83,7 +83,11 @@ def _refresh_data(orch) -> dict[str, int]:
     """
     import json as _json
     from src.agents.alpaca_trading import AlpacaTradingError
-    from src.agents.data_refresh import refresh_one_bar, refresh_option_chains
+    from src.agents.data_refresh import (
+        refresh_one_bar,
+        refresh_option_chains,
+        populate_option_contracts,
+    )
     written: dict[str, int] = {}
     # TIMEFRAME / LOOKBACK_MINUTES / FEED let operators switch the
     # data feed from the cron env without touching code. Default to
@@ -106,6 +110,29 @@ def _refresh_data(orch) -> dict[str, int]:
         logger.warning("Alpaca refresh failed: %s", exc)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Data refresh failed: %s: %s", type(exc).__name__, exc)
+    # Populate option_contracts (the static list of tradeable option
+    # symbols for each underlying). MUST run BEFORE refresh_option_chains,
+    # which only READS from this table to pick the ATM subset. The cloud
+    # runner wipes the DB on every invocation, so this step is the
+    # difference between the option path producing candidates and
+    # silently falling through to the heuristic. Same try/except +
+    # silent-on-error pattern as the other refresh calls.
+    try:
+        n_contracts = populate_option_contracts(
+            orch.settings.universe,
+            db_path=_resolve_db_path(),
+            min_dte=1,
+            max_dte=30,
+            band_pct=0.10,
+        )
+        if n_contracts:
+            logger.info(
+                "option contracts populated: %d symbols, %d contracts",
+                len(n_contracts), sum(n_contracts.values()),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Option contract populate failed: %s: %s",
+                       type(exc).__name__, exc)
     # Option chain refresh: pulls the last 4h of option bars for the
     # ATM subset of ``option_contracts`` and upserts into ``option_bars``.
     # Without this, the option_h4 XGBoost model has no per-contract bar
