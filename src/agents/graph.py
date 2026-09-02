@@ -248,7 +248,77 @@ class Orchestrator:
 
     # ---- public API ----------------------------------------------------
     def run_cycle(self) -> DecisionState:
+        # Pre-flight position management. Runs BEFORE state construction
+        # so the kill-switch can short-circuit and the blocked-symbols
+        # set is on the state when the supervisor reads candidates.
+        # See :mod:`src.agents.position_management` for the contract.
+        from . import position_management as _pm
+        _thresholds = _pm._load_thresholds(self.agents_cfg)
+        preflight = _pm.PreFlightResult()
+        try:
+            live_positions = self.inference._load_portfolio()  # noqa: SLF001
+        except Exception:
+            live_positions = []
+        # (a) Daily loss kill-switch.
+        try:
+            from .journal import _today_realized_pnl
+            realized_today = _today_realized_pnl(self.conn)
+        except Exception:
+            realized_today = 0.0
+        preflight.kill_switch = _pm.check_daily_loss_kill_switch(
+            capital_usd=float(getattr(self.settings, "capital_usd", 100_000.0)),
+            positions=live_positions,
+            realized_pnl_today=realized_today,
+            pct=_thresholds["daily_loss_kill_switch_pct"],
+        )
+        if preflight.kill_switch.breached:
+            state = DecisionState()
+            state.final_action = "NO_TRADE"
+            state.cycle_started_at = _now_iso()
+            state.cycle_completed_at = _now_iso()
+            state.execution_result = {
+                "status": "BLOCKED",
+                "reason": "daily_loss_kill_switch",
+                "detail": preflight.kill_switch.as_dict(),
+            }
+            state.supplementary = {"position_management": preflight.as_dict()}
+            logger.warning(
+                "daily-loss kill switch breached: total_pnl=%.2f threshold=%.2f (pct=%.4f) - skipping cycle",
+                preflight.kill_switch.total_pnl,
+                preflight.kill_switch.threshold_usd,
+                preflight.kill_switch.pct,
+            )
+            # Persist the block as a journal row so the audit trail shows
+            # why the cycle did nothing.
+            try:
+                self.journal.upsert(state)
+            except Exception as exc:  # pragma: no cover
+                logger.warning("kill-switch journal upsert failed: %s", exc)
+            return state
+        # (b) Auto-close per-position stop-losses. Side effect, no state
+        # change to the cycle result. Failures are logged but do not
+        # abort the cycle (a broker outage is non-fatal).
+        try:
+            from .alpaca_trading import AlpacaTradingClient
+            client = AlpacaTradingClient()
+            preflight.stop_loss_closes = _pm.auto_close_stop_loss(
+                client, live_positions,
+                pct=_thresholds["stop_loss_pct"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("auto_close_stop_loss failed: %s: %s",
+                           type(exc).__name__, exc)
+        # (c) Per-symbol cooldown. The blocked set is read by the
+        # supervisor via state.supplementary['position_management'].
+        preflight.blocked_symbols = _pm.get_blocked_symbols(
+            positions=live_positions,
+            conn=self.conn,
+            cooldown_seconds=_thresholds["cooldown_seconds"],
+            open_loss_block_pct=_thresholds["open_loss_block_pct"],
+        )
+        # Build the cycle state with the pre-flight summary attached.
         state = self._new_state()
+        state.supplementary = {"position_management": preflight.as_dict()}
         cycle_error: str | None = None
         cycle_exc: BaseException | None = None
         try:

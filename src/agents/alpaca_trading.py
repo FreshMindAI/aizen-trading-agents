@@ -7,6 +7,8 @@ Mirrors the existing AlpacaClient in src/alpaca_client.py but targets the
   * get_account()               - GET  /v2/account
   * list_positions()            - GET  /v2/positions
   * cancel_order(id)            - DELETE /v2/orders/{id}
+  * close_position(symbol)      - DELETE /v2/positions/{symbol}  (used by the
+                                  per-position stop-loss added 2026-09-02)
 
 End-of-day behavior, retries, and pacing are governed by config/alpaca.yaml
 (trading section). Secrets are loaded once and never logged.
@@ -119,6 +121,20 @@ class AlpacaTradingClient:
 
     def cancel_order(self, order_id: str) -> dict[str, Any]:
         return self._request("DELETE", f"/v2/orders/{order_id}")
+
+    def close_position(self, symbol: str) -> dict[str, Any]:
+        """Market-close an open position via ``DELETE /v2/positions/{symbol}``.
+
+        Used by the per-position stop-loss pre-flight added 2026-09-02
+        (see :mod:`src.agents.position_management`). Alpaca returns the
+        closing order that was created; we surface the standard envelope
+        so callers can log ``broker_order_id`` and ``status`` alongside
+        the rest of the cycle's execution_result. The qty defaults to
+        the full position; a partial close is not supported today
+        (the cycle has one decision per symbol, so a partial close
+        adds no value for our use case).
+        """
+        return self._request("DELETE", f"/v2/positions/{symbol}")
 
     def list_fills(
         self,

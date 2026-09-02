@@ -7,6 +7,7 @@ pick; the math (best-score / no-trade-on-disagreement) is deterministic.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from ...config import get_settings
@@ -20,6 +21,19 @@ from ..protocol import (
     StrategyProposal,
 )
 from ._common import _llm_call, _to_message
+
+logger = logging.getLogger(__name__)
+
+
+def _blocked_symbols(state: DecisionState) -> set[str]:
+    """Read the blocked-symbol set written by the orchestrator's
+    pre-flight (:mod:`src.agents.position_management`). Returns an empty
+    set when the cycle did not run the pre-flight (e.g. tests that call
+    the supervisor directly) so the filter is a no-op.
+    """
+    supp = getattr(state, "supplementary", None) or {}
+    pm = supp.get("position_management") or {}
+    return {s.upper() for s in (pm.get("blocked_symbols") or []) if isinstance(s, str)}
 
 
 def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
@@ -40,6 +54,28 @@ def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
             obs = _supervisor_obs(llm, observations, candidates, "NO_TRADE", "no candidates",
                                   0.1, role, state)
             return _as_update(state, obs, None)
+
+        # (c) Per-symbol cooldown. The orchestrator's pre-flight fills
+        # state.supplementary['position_management']['blocked_symbols']
+        # with the set of symbols that have an open losing position
+        # OR a recent realized loss. Drop those candidates BEFORE the
+        # conflict / confidence gates so we never re-enter a loser.
+        blocked = _blocked_symbols(state)
+        if blocked:
+            before = len(candidates)
+            candidates = [c for c in candidates
+                          if (c.underlying or "").split(" ")[0].upper()
+                          not in blocked]
+            if len(candidates) < before:
+                logger.info(
+                    "supervisor filtered %d candidate(s) on blocked symbols: %s",
+                    before - len(candidates), sorted(blocked),
+                )
+            if not candidates:
+                obs = _supervisor_obs(llm, observations, candidates, "NO_TRADE",
+                                      f"all candidates on blocked symbols {sorted(blocked)}",
+                                      0.2, role, state)
+                return _as_update(state, obs, None)
 
         top = candidates[0]
         if _has_conflict(observations, top) and no_trade_if_disagreement:

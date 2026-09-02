@@ -9,9 +9,37 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any
 
 from .protocol import DecisionState
+
+
+def _today_realized_pnl(conn: sqlite3.Connection, *,
+                       now: datetime | None = None) -> float:
+    """Sum the ``realized_pnl`` column for rows where ``completed_at``
+    is on today's UTC date. Used by the daily-loss kill-switch
+    (:mod:`src.agents.position_management`) to compute today's
+    realized P/L for the cap.
+
+    The function intentionally reads UTC date (the journal column is
+    stored as ISO-8601 with ``Z``) so a paper account that runs on
+    UTC can grade itself consistently across DST flips. The caller
+    can override ``now`` for tests.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    day_prefix = now.strftime("%Y-%m-%d")
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(realized_pnl), 0.0) FROM decision_journal "
+            "WHERE completed_at IS NOT NULL "
+            "AND substr(completed_at, 1, 10) = ?",
+            (day_prefix,),
+        ).fetchone()
+    except Exception:  # pragma: no cover - schema may not exist on fresh DB
+        return 0.0
+    return float(row[0] or 0.0) if row else 0.0
 
 
 class DecisionJournal:

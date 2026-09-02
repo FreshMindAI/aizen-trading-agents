@@ -102,3 +102,36 @@ scoring:
   # cloud cron can override this at runtime via the
   # AIZEN_OPTION_MANDATE_BOOST env var without editing this file.
   option_mandate_boost: 0.30
+
+# Position management (added 2026-09-02 in response to the loss-position
+# audit). Pre-flight checks run at the start of every cycle BEFORE the
+# graph agents fire, so a daily-loss kill-switch can short-circuit the
+# cycle and a per-position stop-loss can auto-close losers before the
+# model sees them. Per-symbol cooldown filters new candidates in the
+# supervisor so the model does not re-enter a symbol it's already
+# bleeding on. Every threshold has an env-var override so the cloud
+# cron can tune without editing this file.
+position_management:
+  # (a) Daily loss kill-switch. If today's realized + open-position
+  # unrealized P/L is worse than this fraction of capital, return
+  # NO_TRADE and skip the cycle. Default -2% of capital.
+  # Env: AIZEN_DAILY_LOSS_KILL_SWITCH_PCT.
+  daily_loss_kill_switch_pct: -0.02
+  # (b) Per-position stop-loss. Any open position whose
+  # unrealized_pnl / cost_basis is worse than this is auto-closed via
+  # a market order on Alpaca. Default -50% (half the premium gone).
+  # Env: AIZEN_STOP_LOSS_PCT.
+  stop_loss_pct: -0.50
+  # (c) Per-symbol cooldown. After a realized loss, block new entries
+  # on that symbol for this many seconds. Default 24h.
+  # Env: AIZEN_COOLDOWN_SECONDS.
+  cooldown_seconds: 86400
+  # (c-ii) While a position is open and in loss by more than this
+  # fraction of cost, treat the symbol as blocked from new entries
+  # (so the model does not "double down" on a losing leg). Default
+  # -1% — tighter than -5% so we prevent new entries on any
+  # meaningful loss, not just catastrophic ones. The
+  # 2026-09-02 COIN/META loss review showed -1% on COIN equity
+  # and -2.5% on COIN260911P00175000 both preceded larger losses;
+  # -1% is the right cut. Env: AIZEN_OPEN_LOSS_BLOCK_PCT.
+  open_loss_block_pct: -0.01

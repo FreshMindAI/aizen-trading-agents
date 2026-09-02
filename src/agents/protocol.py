@@ -306,6 +306,13 @@ class DecisionState(StrictModel):
     realized_pnl: float | None = None
     outcome_label: str | None = None
 
+    # Pre-computed values written by the orchestrator's pre-flight phase
+    # (see :mod:`src.agents.position_management`). Not a journal column;
+    # always populated in-memory by ``Orchestrator.run_cycle`` so the
+    # supervisor can filter ``candidate_strategies`` by blocked symbols
+    # and the trace can record the kill-switch + stop-loss summary.
+    supplementary: dict[str, Any] = Field(default_factory=dict)
+
     @property
     def market_state_hash(self) -> str:
         """Stable hash for journal rows so identical cycles collapse."""
