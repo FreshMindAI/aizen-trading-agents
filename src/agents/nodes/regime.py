@@ -16,7 +16,7 @@ from ..protocol import (
     MessageType,
     RegimeLabel,
 )
-from ._common import AgentResult, _llm_call, _to_message
+from ._common import AgentResult, _llm_call, _log_agent_observation, _to_message
 
 
 def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
@@ -31,6 +31,7 @@ def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
         # Override message_type to REGIME_VIEW.
         obs = obs.model_copy(update={"message_type": MessageType.REGIME_VIEW})
         msg = _to_message(obs, state.decision_id, "regime_agent", "supervisor")
+        _log_agent_observation("regime_agent", obs)
         return AgentResult(observations=[obs], messages=[msg]).as_update()
 
     return node

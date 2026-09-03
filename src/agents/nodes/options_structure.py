@@ -24,7 +24,7 @@ from ..protocol import (
     StrategyProposal,
 )
 from ..scoring import ScoringWeights, rank, score_candidate
-from ._common import AgentResult, _llm_call, _to_message
+from ._common import AgentResult, _llm_call, _log_agent_observation, _to_message
 
 
 def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
@@ -116,6 +116,7 @@ def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
             )
         msg = _to_message(obs, state.decision_id,
                           "options_structure_agent", "supervisor")
+        _log_agent_observation("options_structure_agent", obs)
         return {
             "agent_observations": [obs],
             "agent_messages": [msg],

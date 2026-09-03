@@ -20,7 +20,7 @@ from ..protocol import (
     Side,
     StrategyProposal,
 )
-from ._common import _llm_call, _to_message
+from ._common import _llm_call, _log_agent_observation, _to_message
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,7 @@ def _as_update(state: DecisionState, obs: AgentObservation,
                intent: OrderIntent | None,
                selected: StrategyProposal | None = None) -> dict[str, Any]:
     msg = _to_message(obs, state.decision_id, "supervisor", "execution")
+    _log_agent_observation("supervisor", obs)
     update: dict[str, Any] = {
         "agent_observations": [obs],
         "agent_messages": [msg],

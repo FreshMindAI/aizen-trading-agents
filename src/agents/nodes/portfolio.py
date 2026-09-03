@@ -14,7 +14,7 @@ from ..protocol import (
     DecisionState,
     MessageType,
 )
-from ._common import AgentResult, _llm_call, _to_message
+from ._common import AgentResult, _llm_call, _log_agent_observation, _to_message
 
 
 def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):

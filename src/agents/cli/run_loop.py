@@ -47,10 +47,15 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
 
 # Pin env BEFORE importing anything that reads it.
-# Default to mock LLM so the cron job never tries to reach GMI / MiniMaxAI /
-# MiniMax-M3 (returning HTTP 402) on a cold start. Set AIZEN_LLM_PROVIDER=
-# in render.yaml to override.
-os.environ.setdefault("AIZEN_LLM_PROVIDER", "mock")
+# Important: do NOT ``setdefault("AIZEN_LLM_PROVIDER", "mock")`` here.
+# cron-loop.yml (GitHub Actions) and render.yaml (Render) both set
+# ``AIZEN_LLM_PROVIDER=gmi_fallback`` at the workflow level; if we
+# setdefault() in-process, that env var never reaches the LLM
+# provider resolver and every cycle runs against the mock stub —
+# which is exactly the silent-fallback we hit on 2026-09-02/03.
+# We DO set RUN_MODE/AIZEN_DB_PATH/AIZEN_TRACE because those are
+# infra defaults that are safe to leave alone if the env didn't
+# override them.
 os.environ.setdefault("AIZEN_TRACE", "1")
 os.environ.setdefault("RUN_MODE", "paper")  # Alpaca paper account
 os.environ.setdefault("AIZEN_DB_PATH", "/var/data/aizen/trading.db")
@@ -212,6 +217,18 @@ def run_once() -> int:
     db_path = _resolve_db_path()
     conn = connect(db_path)
     init_db(conn)  # idempotent
+    # Startup data-state log. Emits one INFO line so the operator
+    # can see, at a glance, what the cron tick had to work with:
+    # which LLM provider is active, how many underlying / option /
+    # news rows the DB holds, and when the news snapshot was last
+    # refreshed (the news-pre-tick workflow is separate from this
+    # one, so a stale news timestamp often explains a low GNN bias
+    # in the cycle).
+    try:
+        _log_startup_data_state(conn)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("startup data-state log failed: %s: %s",
+                       type(exc).__name__, exc)
     try:
         orch = Orchestrator(conn=conn)
         n_refreshed = _refresh_data(orch)
@@ -232,6 +249,87 @@ def run_once() -> int:
     finally:
         conn.close()
     return 0
+
+
+def _log_startup_data_state(conn) -> None:
+    """Emit one INFO line summarizing the live data state at cycle start.
+
+    Why this exists: the operator's most common debugging question after
+    a NO_TRADE cycle is "what did the agent see?" Previously, the only
+    way to answer was to dig into the per-cycle JSONL trace under
+    models/cycle_traces/. This log line gives the high-level answer in
+    the cron stdout (visible in the GH Actions log) so the operator can
+    tell at a glance whether the cycle had:
+
+      * a live LLM provider (``mock`` = stub signals, ``gmi_fallback`` /
+        ``anthropic`` / ``openai`` = real reasoning)
+      * enough option_contracts to build a candidate set
+      * enough option_bars to score the option_h4 model
+      * a fresh news snapshot (the news-pre-tick workflow runs every
+        15 min; a stale timestamp here means news is missing or the
+        workflow is broken)
+
+    Format (single line, fixed-width labels for grep-ability)::
+
+        data_state llm=mock underlying_bars=254939 option_contracts=15290 option_bars=195466 news_snapshot=907 news_last=2026-09-02T18:50:00Z news_age_min=12 option_dte_max=10
+    """
+    def _count(table: str) -> int:
+        try:
+            row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+            return int(row[0]) if row else 0
+        except Exception:  # noqa: BLE001
+            return -1
+
+    underlying_bars = _count("underlying_bars")
+    option_contracts = _count("option_contracts")
+    option_bars = _count("option_bars")
+    news_snapshot = _count("news_snapshot")
+    # Most-recent news timestamp + age in minutes. Used to flag stale
+    # news before the agent runs.
+    news_last_iso: str | None = None
+    news_age_min: int | None = None
+    try:
+        row = conn.execute(
+            "SELECT timestamp FROM news_snapshot ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        if row and row[0]:
+            news_last_iso = str(row[0])
+            from datetime import datetime, timezone
+            try:
+                last_dt = datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+                age_s = (datetime.now(timezone.utc) - last_dt).total_seconds()
+                news_age_min = int(age_s // 60)
+            except Exception:  # noqa: BLE001
+                news_age_min = None
+    except Exception:  # noqa: BLE001
+        pass
+    # Max days_to_expiry currently in option_contracts. A 0 here means
+    # all contracts are already expired (which is why
+    # options_structure_agent returned candidates_returned=0 on
+    # 2026-09-03: the latest expiry was 2026-09-02, yesterday).
+    option_dte_max: int | None = None
+    try:
+        row = conn.execute(
+            "SELECT MAX(julianday(expiration_date) - julianday('now')) "
+            "FROM option_contracts WHERE expiration_date IS NOT NULL"
+        ).fetchone()
+        if row and row[0] is not None:
+            option_dte_max = int(float(row[0]))
+    except Exception:  # noqa: BLE001
+        pass
+    llm_provider = os.environ.get("AIZEN_LLM_PROVIDER", "(unset)")
+    news_age_str = (
+        f"{news_age_min}m" if news_age_min is not None else "?"
+    )
+    dte_str = str(option_dte_max) if option_dte_max is not None else "?"
+    logger.info(
+        "data_state llm=%s underlying_bars=%d option_contracts=%d "
+        "option_bars=%d news_snapshot=%d news_last=%s news_age_min=%s "
+        "option_dte_max=%s",
+        llm_provider, underlying_bars, option_contracts,
+        option_bars, news_snapshot, news_last_iso or "(none)",
+        news_age_str, dte_str,
+    )
 
 
 def _rebuild_dashboard() -> None:

@@ -14,7 +14,7 @@ from ..protocol import (
     DecisionState,
     MessageType,
 )
-from ._common import AgentResult, _llm_call, _to_message
+from ._common import AgentResult, _llm_call, _log_agent_observation, _to_message
 
 
 def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
@@ -35,6 +35,7 @@ def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
         obs = _llm_call(llm, "volatility_agent", role, payload, AgentObservation)
         obs = obs.model_copy(update={"message_type": MessageType.VOLATILITY_VIEW})
         msg = _to_message(obs, state.decision_id, "volatility_agent", "supervisor")
+        _log_agent_observation("volatility_agent", obs)
         return AgentResult(observations=[obs], messages=[msg]).as_update()
 
     return node
