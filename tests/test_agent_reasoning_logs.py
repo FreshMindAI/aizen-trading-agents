@@ -210,7 +210,30 @@ def test_log_startup_data_state_emits_required_keys(tmp_path, caplog):
     # The seeded contracts gave us a non-zero news count.
     assert "news_snapshot=2" in msg
     assert "option_contracts=2" in msg
+    # Default label appears in the leading key.
+    assert msg.startswith("data_state ")
     conn.close()
+
+
+def test_log_startup_data_state_accepts_label_for_before_after_diff(caplog):
+    """The post-refresh log line uses label='data_state_after_refresh' so
+    the operator can grep the BEFORE/AFTER pair with a single regex."""
+    from src.agents.cli.run_loop import _log_startup_data_state
+    from src.db import init_db
+    import tempfile, os
+
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    init_db(conn)
+    with caplog.at_level(logging.INFO, logger="run_loop"):
+        _log_startup_data_state(conn, label="data_state_after_refresh")
+    matching = [r for r in caplog.records
+                if r.name == "run_loop" and "data_state_after_refresh" in r.getMessage()]
+    assert len(matching) == 1
+    conn.close()
+    os.unlink(path)
 
 
 def test_log_startup_data_state_handles_empty_db(caplog):
@@ -236,5 +259,10 @@ def test_log_startup_data_state_handles_empty_db(caplog):
     assert "option_contracts=0" in msg
     # No news rows -> "(none)" sentinel.
     assert "news_last=(none)" in msg
+    # The "no tradable options" WARNING should also fire for an empty DB.
+    warning_lines = [r for r in caplog.records
+                     if r.name == "run_loop" and r.levelname == "WARNING"
+                     and "no tradable options" in r.getMessage()]
+    assert len(warning_lines) == 1
     conn.close()
     os.unlink(path)
