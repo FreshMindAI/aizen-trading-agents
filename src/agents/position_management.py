@@ -84,11 +84,15 @@ def _load_thresholds(agents_cfg: dict[str, Any] | None = None) -> dict[str, floa
     return {
         "daily_loss_kill_switch_pct": _env_float(
             "AIZEN_DAILY_LOSS_KILL_SWITCH_PCT",
-            float(cfg_pm.get("daily_loss_kill_switch_pct", -0.02)),
+            float(cfg_pm.get("daily_loss_kill_switch_pct", -0.03)),
         ),
         "stop_loss_pct": _env_float(
             "AIZEN_STOP_LOSS_PCT",
-            float(cfg_pm.get("stop_loss_pct", -0.50)),
+            float(cfg_pm.get("stop_loss_pct", -0.30)),
+        ),
+        "profit_take_pct": _env_float(
+            "AIZEN_PROFIT_TAKE_PCT",
+            float(cfg_pm.get("profit_take_pct", 0.50)),
         ),
         "cooldown_seconds": _env_float(
             "AIZEN_COOLDOWN_SECONDS",
@@ -105,7 +109,7 @@ def _load_thresholds(agents_cfg: dict[str, Any] | None = None) -> dict[str, floa
         # default. Gives the operator a visible signal before disaster.
         "early_warning_pct": _env_float(
             "AIZEN_EARLY_WARNING_PCT",
-            float(cfg_pm.get("early_warning_pct", -0.25)),
+            float(cfg_pm.get("early_warning_pct", -0.15)),
         ),
     }
 
@@ -232,13 +236,14 @@ def positions_to_close(
 def early_warning_positions(
     positions: Iterable[Any],
     *,
-    pct: float = -0.25,
+    pct: float = -0.15,
+    stop_loss_pct: float = -0.30,
 ) -> list[dict[str, Any]]:
     """Return positions whose loss is worse than ``pct`` of cost basis but
-    has not yet crossed the -50% stop-loss threshold. These are pure
+    has not yet crossed the ``stop_loss_pct`` threshold. These are pure
     warnings — no auto-close fires — but they give the operator a
     visible signal ~halfway to disaster so they can intervene before
-    the -50% cutoff is reached.
+    the stop-loss cutoff is reached.
 
     The same dict shape as :func:`positions_to_close` is returned so
     the caller can log uniformly. A position that would also be
@@ -267,7 +272,7 @@ def early_warning_positions(
             continue
         loss_pct = upl / (entry * abs(qty))
         # Only the "early" zone: between warning and stop-loss.
-        if loss_pct <= pct and loss_pct > -0.50:
+        if loss_pct <= pct and loss_pct > stop_loss_pct:
             out.append({
                 "symbol": symbol,
                 "quantity": int(abs(qty)),
@@ -275,6 +280,100 @@ def early_warning_positions(
                 "current_price": mark,
                 "unrealized_pnl": upl,
                 "loss_pct": loss_pct,
+            })
+    return out
+
+
+def profit_take_positions(
+    positions: Iterable[Any],
+    *,
+    pct: float = 0.50,
+) -> list[dict[str, Any]]:
+    """Return positions whose unrealized GAIN exceeds ``pct`` of cost
+    basis. The intent is to lock in option premium before it decays
+    or the move reverses.
+
+    Symmetric to :func:`positions_to_close` but for the +X% side. The
+    default ``+0.50`` (+50%) is the user-tuned value; the previous
+    behavior had no profit-take, so winners could round-trip back to
+    breakeven before the operator noticed. The same idempotency
+    rules apply (a 404 on the close is success, not error).
+    """
+    out: list[dict[str, Any]] = []
+    for p in positions:
+        if isinstance(p, dict):
+            symbol = p.get("symbol")
+            qty = float(p.get("qty") or p.get("quantity") or 0)
+            entry = float(p.get("avg_entry_price") or p.get("entry_price") or 0)
+            mark = float(p.get("current_price") or p.get("mark_price") or entry)
+            upl = float(p.get("unrealized_pl") or p.get("unrealized_pnl") or
+                        ((mark - entry) * qty))
+        else:
+            symbol = getattr(p, "symbol", None)
+            qty = float(getattr(p, "quantity", 0) or 0)
+            entry = float(getattr(p, "entry_price", 0) or 0)
+            mark = float(getattr(p, "current_price", None) or
+                         getattr(p, "mark_price", 0) or entry)
+            upl = float(getattr(p, "unrealized_pnl", None) or
+                        ((mark - entry) * qty))
+        if not symbol or qty == 0 or entry <= 0:
+            continue
+        gain_pct = upl / (entry * abs(qty))
+        if gain_pct >= pct:  # pct is positive; 0.50 means "gain >= 50%"
+            out.append({
+                "symbol": symbol,
+                "quantity": int(abs(qty)),
+                "entry_price": entry,
+                "current_price": mark,
+                "unrealized_pnl": upl,
+                "gain_pct": gain_pct,
+            })
+    return out
+
+
+def auto_close_profit_take(client, positions: Iterable[Any], *,
+                          pct: float = 0.50) -> list[dict[str, Any]]:
+    """Market-close every position whose gain exceeds ``pct`` of cost
+    basis. Symmetric to :func:`auto_close_stop_loss`. Same 404-as-
+    already-closed idempotency rule applies.
+    """
+    to_close = profit_take_positions(positions, pct=pct)
+    out: list[dict[str, Any]] = []
+    for pos in to_close:
+        sym = pos["symbol"]
+        try:
+            res = client.close_position(sym)
+            out.append({
+                "symbol": sym,
+                "status": "closed",
+                "broker_order_id": (res or {}).get("id"),
+                "gain_pct": pos["gain_pct"],
+                "unrealized_pnl": pos["unrealized_pnl"],
+            })
+            logger.info(
+                "profit-take closed %s @ gain_pct=%.2f%% unrealized_pnl=%.2f",
+                sym, pos["gain_pct"] * 100, pos["unrealized_pnl"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = f"{type(exc).__name__}: {exc}"
+            if "404" in msg or "position does not exist" in msg.lower() \
+                    or "not found" in msg.lower():
+                logger.info(
+                    "profit-take: %s already closed by another path (%s)",
+                    sym, msg,
+                )
+                out.append({
+                    "symbol": sym,
+                    "status": "already_closed",
+                    "gain_pct": pos["gain_pct"],
+                    "unrealized_pnl": pos["unrealized_pnl"],
+                })
+                continue
+            logger.warning("profit-take close failed for %s: %s", sym, msg)
+            out.append({
+                "symbol": sym,
+                "status": "error",
+                "error": msg,
             })
     return out
 
@@ -447,6 +546,7 @@ class PreFlightResult:
     ``state.supplementary['position_management']`` for the trace."""
     kill_switch: KillSwitchResult | None = None
     stop_loss_closes: list[dict[str, Any]] = field(default_factory=list)
+    profit_take_closes: list[dict[str, Any]] = field(default_factory=list)
     blocked_symbols: set[str] = field(default_factory=set)
     early_warnings: list[dict[str, Any]] = field(default_factory=list)
     kill_switch_latched: bool = False
@@ -456,6 +556,7 @@ class PreFlightResult:
         return {
             "kill_switch": self.kill_switch.as_dict() if self.kill_switch else None,
             "stop_loss_closes": self.stop_loss_closes,
+            "profit_take_closes": self.profit_take_closes,
             "blocked_symbols": sorted(self.blocked_symbols),
             "early_warnings": self.early_warnings,
             "kill_switch_latched": self.kill_switch_latched,

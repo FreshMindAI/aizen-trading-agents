@@ -94,21 +94,22 @@ def _full_db(tmp_path: Path) -> sqlite3.Connection:
 # 2. -25% early warning
 # ---------------------------------------------------------------------------
 def test_early_warning_returns_positions_in_warning_zone():
-    """A position at -30% loss is in the early-warning zone (between
-    -25% and -50%) and must be returned with a warning entry."""
-    pos = _make_pos("AAPL", 10, 100, 70)  # -30%
-    out = pm.early_warning_positions([pos], pct=-0.25)
+    """A position at -20% loss is in the early-warning zone (between
+    -15% warning and -30% stop-loss) and must be returned with a
+    warning entry."""
+    pos = _make_pos("AAPL", 10, 100, 80)  # -20%
+    out = pm.early_warning_positions([pos], pct=-0.15, stop_loss_pct=-0.30)
     assert len(out) == 1
     assert out[0]["symbol"] == "AAPL"
-    assert out[0]["loss_pct"] == pytest.approx(-0.30)
+    assert out[0]["loss_pct"] == pytest.approx(-0.20)
 
 
 def test_early_warning_excludes_stop_loss_zone():
-    """A position at -60% loss is past the -50% stop-loss; it should
+    """A position at -60% loss is past the -30% stop-loss; it should
     NOT also appear in the warning list (the auto-close is the
     louder signal — the warning would be redundant noise)."""
     pos = _make_pos("NVDA", 1, 200, 80)  # -60%
-    out = pm.early_warning_positions([pos], pct=-0.25)
+    out = pm.early_warning_positions([pos], pct=-0.15, stop_loss_pct=-0.30)
     assert out == []
 
 
@@ -116,7 +117,7 @@ def test_early_warning_excludes_safe_positions():
     """A position at -5% loss is well below the warning threshold;
     no warning, no entry."""
     pos = _make_pos("MSFT", 5, 400, 380)  # -5%
-    out = pm.early_warning_positions([pos], pct=-0.25)
+    out = pm.early_warning_positions([pos], pct=-0.15, stop_loss_pct=-0.30)
     assert out == []
 
 
@@ -286,3 +287,160 @@ def test_orchestrator_short_circuits_on_latched_kill_switch(monkeypatch, tmp_pat
         # Broker was never queried (latch short-circuits first).
         instance.list_positions.assert_not_called()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-03 threshold + profit-take additions
+# ---------------------------------------------------------------------------
+def test_early_warning_excludes_stop_loss_zone_with_param():
+    """The -15% warning must exclude any position already past the
+    -30% stop-loss. Test with an explicit stop_loss_pct=-0.30 to lock
+    in the parameterised behavior."""
+    pos = _make_pos("NVDA", 1, 200, 80)  # -60% past -30%
+    out = pm.early_warning_positions([pos], pct=-0.15, stop_loss_pct=-0.30)
+    assert out == []
+
+
+def test_early_warning_default_stop_loss_30():
+    """Default stop_loss_pct param is -0.30; a -20% position is in
+    the warning zone, a -40% is past the stop-loss."""
+    warning_pos = _make_pos("AAPL", 1, 100, 80)  # -20%
+    stop_pos = _make_pos("NVDA", 1, 100, 50)  # -50%
+    out = pm.early_warning_positions([warning_pos, stop_pos])
+    assert len(out) == 1
+    assert out[0]["symbol"] == "AAPL"
+
+
+def test_profit_take_returns_positions_above_threshold():
+    """A position at +60% gain is past the +50% profit-take; returned."""
+    pos = _make_pos("AAPL", 1, 100, 160)  # +60%
+    out = pm.profit_take_positions([pos], pct=0.50)
+    assert len(out) == 1
+    assert out[0]["symbol"] == "AAPL"
+    assert out[0]["gain_pct"] == pytest.approx(0.60)
+
+
+def test_profit_take_excludes_positions_below_threshold():
+    """A position at +20% gain is below the +50% profit-take; not returned."""
+    pos = _make_pos("AAPL", 1, 100, 120)  # +20%
+    out = pm.profit_take_positions([pos], pct=0.50)
+    assert out == []
+
+
+def test_profit_take_excludes_losers():
+    """A losing position is never profit-taken, even at -50%."""
+    pos = _make_pos("NVDA", 1, 100, 50)  # -50%
+    out = pm.profit_take_positions([pos], pct=0.50)
+    assert out == []
+
+
+def test_auto_close_profit_take_happy_path():
+    """A +60% position is closed; status='closed', broker_order_id set."""
+    pos = _make_pos("AAPL", 1, 100, 160)
+    client = MagicMock()
+    client.close_position.return_value = {"id": "order-999"}
+    results = pm.auto_close_profit_take(client, [pos], pct=0.50)
+    assert results[0]["status"] == "closed"
+    assert results[0]["broker_order_id"] == "order-999"
+
+
+def test_auto_close_profit_take_404_is_already_closed():
+    """404 from the broker on a profit-take is 'already_closed', not error."""
+    pos = _make_pos("AAPL", 1, 100, 160)
+    client = MagicMock()
+    client.close_position.side_effect = RuntimeError(
+        "alpaca trading 404 on DELETE /v2/positions/AAPL: ..."
+    )
+    results = pm.auto_close_profit_take(client, [pos], pct=0.50)
+    assert results[0]["status"] == "already_closed"
+
+
+def test_load_thresholds_default_stop_loss_is_30():
+    """Pin the new default stop_loss_pct at -0.30 (tightened from
+    -0.50 on 2026-09-03). A regression here would mean the old -50%
+    is back, which the COIN/META loss review explicitly rejected."""
+    from src.agents import position_management as pm_mod
+    # Pass no agents_cfg so the code's own default is the answer.
+    thr = pm_mod._load_thresholds(None)
+    assert thr["stop_loss_pct"] == pytest.approx(-0.30)
+
+
+def test_load_thresholds_default_daily_cap_is_3pct():
+    """Pin the new default daily_loss_kill_switch_pct at -0.03
+    (loosened from -0.02 on 2026-09-03)."""
+    from src.agents import position_management as pm_mod
+    thr = pm_mod._load_thresholds(None)
+    assert thr["daily_loss_kill_switch_pct"] == pytest.approx(-0.03)
+
+
+def test_load_thresholds_default_profit_take_is_50pct():
+    """Pin the new default profit_take_pct at +0.50."""
+    from src.agents import position_management as pm_mod
+    thr = pm_mod._load_thresholds(None)
+    assert thr["profit_take_pct"] == pytest.approx(0.50)
+
+
+# ---------------------------------------------------------------------------
+# MCP server wiring (execution node)
+# ---------------------------------------------------------------------------
+def test_execution_calls_mcp_get_positions(monkeypatch, tmp_path):
+    """When the execution node is built with a SkillRegistry, it
+    must call get_positions through the registry before submitting
+    the order. The pre-flight call exercises the MCP wiring without
+    changing the submit path."""
+    from src.agents.mcp import AlpacaMCPServer
+    from src.agents.mcp.skills import build_skill_registry
+    from src.agents.nodes import execution as exec_node
+    from src.agents.protocol import (
+        DecisionState, OrderIntent, RiskDecision, RiskAction, Side,
+        StrategyProposal, Leg, AgentObservation, MessageType,
+    )
+    from datetime import datetime, timezone
+    import sqlite3
+    from src.db import init_db
+
+    # Stub AlpacaTradingClient inside execution so the test never
+    # tries to reach the broker.
+    monkeypatch.setenv("AIZEN_LLM_PROVIDER", "mock")
+    monkeypatch.setenv("RUN_MODE", "paper")
+    with patch("src.agents.nodes.execution.AlpacaTradingClient") as MockClient:
+        instance = MagicMock()
+        instance.submit_order.return_value = {
+            "id": "broker-1", "status": "submitted",
+            "symbol": "AAPL", "qty": 1, "side": "buy",
+        }
+        MockClient.return_value = instance
+
+        server = AlpacaMCPServer(run_mode="paper")
+        skills = build_skill_registry("execution", server)
+        # Patch the MCP server's trading client too so get_positions
+        # returns a stub list without hitting the broker.
+        with patch.object(server, "_get_trading_client") as mock_get_tc:
+            mock_get_tc.return_value.list_positions.return_value = [
+                {"symbol": "AAPL", "qty": 1, "avg_entry_price": 150.0,
+                 "current_price": 155.0},
+            ]
+            node = exec_node.build_node(
+                llm=MagicMock(), config={"run_mode": "paper"},
+                risk_limits=None, skills=skills,
+            )
+            intent = OrderIntent(
+                strategy_id="test", underlying="AAPL",
+                legs=[Leg(asset_class="equity", contract_symbol="AAPL",
+                          side=Side.BUY, quantity=1)],
+                quantity=1,
+            )
+            state = DecisionState(
+                decision_id="dec-1",
+                cycle_started_at=datetime.now(timezone.utc).isoformat(),
+                order_intent=intent,
+                risk_decision=RiskDecision(
+                    decision=RiskAction.APPROVE, approved_quantity=1,
+                    max_loss=100.0, reasons=[],
+                ),
+            )
+            out = node(state)
+            # MCP pre-flight was called, broker submit happened.
+            assert out["mcp_preflight"]["called"] is True
+            assert out["mcp_preflight"]["n_positions"] == 1
+            instance.submit_order.assert_called_once()

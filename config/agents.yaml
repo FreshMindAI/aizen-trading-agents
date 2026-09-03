@@ -114,14 +114,23 @@ scoring:
 position_management:
   # (a) Daily loss kill-switch. If today's realized + open-position
   # unrealized P/L is worse than this fraction of capital, return
-  # NO_TRADE and skip the cycle. Default -2% of capital.
+  # NO_TRADE and skip the cycle. Default -3% of capital (loosened
+  # from -2% on 2026-09-03 to give the daily P/L more headroom on
+  # a quiet session; per-position stop-loss catches the real losses).
   # Env: AIZEN_DAILY_LOSS_KILL_SWITCH_PCT.
-  daily_loss_kill_switch_pct: -0.02
+  daily_loss_kill_switch_pct: -0.03
   # (b) Per-position stop-loss. Any open position whose
   # unrealized_pnl / cost_basis is worse than this is auto-closed via
-  # a market order on Alpaca. Default -50% (half the premium gone).
+  # a market order on Alpaca. Default -30% (tightened from -50% on
+  # 2026-09-03 after the COIN/META loss review: fire earlier on a
+  # losing leg, lock the remaining premium).
   # Env: AIZEN_STOP_LOSS_PCT.
-  stop_loss_pct: -0.50
+  stop_loss_pct: -0.30
+  # (b2) Profit-take. Symmetric to stop-loss: close any position
+  # whose gain exceeds +pct of cost basis. Default +50% (lock in
+  # option premium before decay / reversal; new on 2026-09-03).
+  # Env: AIZEN_PROFIT_TAKE_PCT.
+  profit_take_pct: 0.50
   # (c) Per-symbol cooldown. After a realized loss, block new entries
   # on that symbol for this many seconds. Default 24h.
   # Env: AIZEN_COOLDOWN_SECONDS.
@@ -135,3 +144,9 @@ position_management:
   # and -2.5% on COIN260911P00175000 both preceded larger losses;
   # -1% is the right cut. Env: AIZEN_OPEN_LOSS_BLOCK_PCT.
   open_loss_block_pct: -0.01
+  # (c-iii) Early-warning threshold. Log a WARNING (no auto-close)
+  # when a position crosses this loss fraction, halfway between
+  # "safe" and the -30% stop-loss. Default -15% (added 2026-09-03
+  # as part of the position-management hardening). Env:
+  # AIZEN_EARLY_WARNING_PCT.
+  early_warning_pct: -0.15

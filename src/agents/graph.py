@@ -362,12 +362,14 @@ class Orchestrator:
             except Exception as exc:  # pragma: no cover
                 logger.warning("kill-switch journal upsert failed: %s", exc)
             return state
-        # (a1) Early warning. -25% (configurable) loss is halfway to
-        # the -50% stop-loss. Log a WARNING per position so the
+        # (a1) Early warning. -15% (configurable) loss is halfway to
+        # the -30% stop-loss. Log a WARNING per position so the
         # operator can see it on the cron trace; record the list in
         # preflight.early_warnings so the journal row also reflects it.
         preflight.early_warnings = _pm.early_warning_positions(
-            live_positions, pct=_thresholds["early_warning_pct"],
+            live_positions,
+            pct=_thresholds["early_warning_pct"],
+            stop_loss_pct=_thresholds["stop_loss_pct"],
         )
         for w in preflight.early_warnings:
             logger.warning(
@@ -386,6 +388,18 @@ class Orchestrator:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("auto_close_stop_loss failed: %s: %s",
+                           type(exc).__name__, exc)
+        # (b2) Profit-take. Symmetric to (b): close any position whose
+        # gain exceeds +pct of cost basis. Locks in option premium
+        # before decay / reversal. Same idempotency + fail-soft
+        # contract as stop-loss.
+        try:
+            preflight.profit_take_closes = _pm.auto_close_profit_take(
+                _client, live_positions,
+                pct=_thresholds["profit_take_pct"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("auto_close_profit_take failed: %s: %s",
                            type(exc).__name__, exc)
         # (c) Per-symbol cooldown. The blocked set is read by the
         # supervisor via state.supplementary['position_management'].

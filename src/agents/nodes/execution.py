@@ -46,6 +46,28 @@ def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
         if not _validate_intent(intent):
             return _invalid_result(state, intent)
 
+        # Pre-flight MCP read: confirm the live portfolio via the
+        # in-process MCP server. Exercises the SkillRegistry wiring
+        # without changing submit behavior (the multi-leg intent is
+        # still submitted atomically via AlpacaTradingClient below;
+        # the MCP ``submit_order`` tool only handles single-leg).
+        # When ``skills`` is None (e.g., older tests) we skip the
+        # MCP read and rely on the direct client path.
+        mcp_preflight: dict[str, Any] = {"called": False}
+        if skills is not None and "get_positions" in skills.allowed_tool_names():
+            try:
+                live = skills.call("get_positions", {})
+                mcp_preflight = {
+                    "called": True,
+                    "n_positions": len(live) if isinstance(live, list) else None,
+                }
+            except Exception as exc:  # noqa: BLE001
+                # MCP failure must not block a validated intent; the
+                # direct submit path is the source of truth.
+                logger.warning("execution mcp get_positions failed: %s: %s",
+                               type(exc).__name__, exc)
+                mcp_preflight = {"called": True, "error": f"{type(exc).__name__}: {exc}"}
+
         run_mode = (config.get("run_mode") or "paper").lower()
         if run_mode == "dry-run":
             execution = _dry_run_submission(intent)
@@ -55,12 +77,14 @@ def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
 
         obs = _llm_call(llm, "execution_agent", role,
                         {"intent": intent.model_dump(mode="json"),
-                         "result": execution}, AgentObservation)
+                         "result": execution,
+                         "mcp_preflight": mcp_preflight}, AgentObservation)
         obs = obs.model_copy(update={"message_type": MessageType.EXECUTION_RESULT})
 
         return {
             "agent_observations": [obs],
             "execution_result": execution,
+            "mcp_preflight": mcp_preflight,
             "final_action": _final_action_from(execution),
             "cycle_completed_at": _now_iso(),
         }
