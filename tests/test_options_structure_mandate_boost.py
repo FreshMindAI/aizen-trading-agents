@@ -80,12 +80,12 @@ def test_real_ml_option_in_strict_dte_window_gets_mandate_boost():
     )
     weights = ScoringWeights()
 
-    no_boost, _ = _build_candidates(
+    no_boost, _, _ = _build_candidates(
         snap, weights, 0.0, 5,           # min_score=0 so the candidate is kept
         dte_min=5, dte_max=10, gnn_output={},
         option_mandate_boost=0.0,
     )
-    with_boost, _ = _build_candidates(
+    with_boost, _, _ = _build_candidates(
         snap, weights, 0.0, 5,
         dte_min=5, dte_max=10, gnn_output={},
         option_mandate_boost=0.20,
@@ -115,12 +115,12 @@ def test_heuristic_option_does_not_get_mandate_boost():
     )
     weights = ScoringWeights()
 
-    no_boost, _ = _build_candidates(
+    no_boost, _, _ = _build_candidates(
         snap, weights, 0.0, 5,
         dte_min=5, dte_max=10, gnn_output={},
         option_mandate_boost=0.0,
     )
-    with_boost, _ = _build_candidates(
+    with_boost, _, _ = _build_candidates(
         snap, weights, 0.0, 5,
         dte_min=5, dte_max=10, gnn_output={},
         option_mandate_boost=0.20,
@@ -146,7 +146,7 @@ def test_option_outside_strict_dte_window_does_not_get_mandate_boost():
     )
     weights = ScoringWeights()
 
-    with_boost, dte_note = _build_candidates(
+    with_boost, dte_note, _ = _build_candidates(
         snap, weights, 0.0, 5,
         dte_min=5, dte_max=10, gnn_output={},
         option_mandate_boost=0.20,
@@ -181,7 +181,7 @@ def test_boost_makes_option_outrank_equivalent_equity_candidate():
         min_equity_direction_probability=0.55,
     )
 
-    options, _ = _build_candidates(
+    options, _, _ = _build_candidates(
         snap, weights, 0.0, 5,
         dte_min=5, dte_max=10, gnn_output={},
         option_mandate_boost=0.20,

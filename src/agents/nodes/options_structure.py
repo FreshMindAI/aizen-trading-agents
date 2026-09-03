@@ -54,17 +54,41 @@ def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
         os.environ.get("AIZEN_OPTION_MANDATE_BOOST")
         or (config.get("scoring") or {}).get("option_mandate_boost", 0.30)
     )
+    # Option-side rejection gates (P0-1 fix). The 2026-09-03 AVGO live
+    # fill exposed two gaps in the candidate build path:
+    #   1) the supervisor's confidence gate was bypassed by inflating
+    #      probability_profit with the mandate boost, so a 0.37 P(profit)
+    #      option was dressed up to 0.67 and approved;
+    #   2) there was no direction-vs-leg match check, so a long put was
+    #      built for AVGO despite direction_probability=0.667 (bullish).
+    # These two gates are now hard floors inside _build_candidates so a
+    # bad candidate dies before scoring. Defaults:
+    #   * min_option_probability_profitable = 0.40 (must be profitable
+    #     at least 40% of the time, ignoring mandate);
+    #   * direction_mismatch_buffer = 0.05 (a long-PUT needs dp<0.45,
+    #     a long-CALL needs dp>0.55). Anything in the 0.45-0.55 dead-band
+    #     is neutral and both sides are allowed.
+    min_option_pp = float(
+        os.environ.get("AIZEN_MIN_OPTION_PP")
+        or (config.get("thresholds") or {}).get("min_option_probability_profitable", 0.40)
+    )
+    direction_mismatch_buffer = float(
+        os.environ.get("AIZEN_DIRECTION_MISMATCH_BUFFER")
+        or (config.get("thresholds") or {}).get("direction_mismatch_buffer", 0.05)
+    )
 
     def node(state: DecisionState) -> dict[str, Any]:
         snap = state.market_snapshot
         if snap is None:
             return {}
-        option_candidates, dte_fallback = _build_candidates(
+        option_candidates, dte_fallback, rejection_summary = _build_candidates(
             snap, weights, candidate_min_score, candidate_size,
             dte_min=risk_limits.allowed_expiries_dte_min,
             dte_max=risk_limits.allowed_expiries_dte_max,
             gnn_output=state.gnn_output or {},
             option_mandate_boost=option_mandate_boost,
+            min_option_pp=min_option_pp,
+            direction_mismatch_buffer=direction_mismatch_buffer,
         )
         # Parallel options+stocks path: build long-equity candidates
         # from the same ML/GNN signal. The supervisor then chooses the
@@ -99,16 +123,27 @@ def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
                 # trace + supervisor both see why we're not in the strict
                 # 5-10 band. Treated as informational, not a risk.
                 signal["dte_fallback"] = dte_fallback
+            # P0-1: surface option-rejection counts so the operator can
+            # see WHY the option side is short. Without this the trace
+            # shows "candidates_option=0" with no reason and the next
+            # debugging step is always "what was rejected?".
+            if rejection_summary and any(rejection_summary.values()):
+                signal["option_rejections"] = rejection_summary
             obs = obs.model_copy(update={
                 "message_type": MessageType.STRATEGY_PROPOSAL,
                 "signal": signal,
             })
         else:
+            empty_signal: dict[str, Any] = {"candidates_returned": 0}
+            if dte_fallback is not None:
+                empty_signal["dte_fallback"] = dte_fallback
+            if rejection_summary and any(rejection_summary.values()):
+                empty_signal["option_rejections"] = rejection_summary
             obs = AgentObservation(
                 agent_id="options_structure_agent",
                 message_type=MessageType.STRATEGY_PROPOSAL,
                 confidence=0.2,
-                signal={"candidates_returned": 0, "dte_fallback": dte_fallback} if dte_fallback else {"candidates_returned": 0},
+                signal=empty_signal,
                 evidence=["no option chains or equity signals met the min-score filter"],
                 risks=["empty candidate set"],
                 data_version="options_structure-1",
@@ -131,8 +166,36 @@ def _build_candidates(
     dte_min: int, dte_max: int,
     gnn_output: dict | None = None,
     option_mandate_boost: float = 0.0,
-) -> tuple[list[StrategyProposal], str | None]:
+    min_option_pp: float = 0.40,
+    direction_mismatch_buffer: float = 0.05,
+) -> tuple[list[StrategyProposal], str | None, dict[str, list[str]]]:
+    """Build option candidate strategies from the option chain.
+
+    Returns ``(proposals, dte_fallback_note, rejection_summary)``.
+
+    The third return value is new in P0-1: a per-reason counter list so
+    the operator trace shows WHY options were dropped. Today the
+    candidate set is "0" or "5" with no visibility into the
+    intermediate rejections, and a 0/5 cycle is the most common
+    question in cron debugging. ``rejection_summary`` keys are:
+
+      * ``min_pp`` — contracts whose ``probability_profitable`` is below
+        ``min_option_pp`` (default 0.40);
+      * ``direction_mismatch`` — contracts whose leg side contradicts
+        the direction signal (long-PUT when direction_probability is
+        bullish past the buffer, or long-CALL when bearish);
+      * ``missing_data`` — contracts with no ``probability_profitable``
+        / ``expected_return`` / ``days_to_expiry``.
+
+    Each value is a short list of ``"<symbol>:<strike>:<reason>"`` for
+    the first few rejects (capped at 8) so the trace JSON stays small.
+    """
     out: list[StrategyProposal] = []
+    rejection_summary: dict[str, list[str]] = {
+        "min_pp": [],
+        "direction_mismatch": [],
+        "missing_data": [],
+    }
     gnn_features = (gnn_output or {}).get("node_features", {}) or {}
     # Membership is by string symbol; Pydantic UnderlyingScore instances
     # are not equal to plain strings, so build a set up front.
@@ -154,13 +217,58 @@ def _build_candidates(
         if underlying not in universe_symbols:
             continue
         if opt.probability_profitable is None or opt.expected_return is None:
+            if len(rejection_summary["missing_data"]) < 8:
+                rejection_summary["missing_data"].append(
+                    f"{opt.contract_symbol}:no_pp_or_er"
+                )
             continue
         if opt.days_to_expiry is None:
+            if len(rejection_summary["missing_data"]) < 8:
+                rejection_summary["missing_data"].append(
+                    f"{opt.contract_symbol}:no_dte"
+                )
             continue
         dte = opt.days_to_expiry
         if not (dte_min_eff <= dte <= dte_max_eff):
             continue
         if opt.days_to_expiry <= 0:
+            continue
+        # P0-1 fix: hard floor on probability_profitable. The 2026-09-03
+        # AVGO long-put was approved with P(profit)=0.37 because the
+        # mandate boost later inflated the supervisor's confidence. We
+        # cut the candidate here, BEFORE scoring, so it never sees the
+        # boost. The threshold is a probability, not a confidence, so
+        # the boost is now only a tie-breaker inside the score itself.
+        if float(opt.probability_profitable) < min_option_pp:
+            if len(rejection_summary["min_pp"]) < 8:
+                rejection_summary["min_pp"].append(
+                    f"{opt.contract_symbol}:pp={float(opt.probability_profitable):.2f}"
+                )
+            continue
+        # P0-1 fix: direction-mismatch gate. A long PUT profits from a
+        # drop; a long CALL profits from a rise. If the direction
+        # signal is strongly opposite the leg's payoff shape, the
+        # candidate is dropped with a reason that surfaces in the
+        # trace. The buffer keeps 0.45-0.55 neutral symbols (a
+        # coin-flip direction) eligible for both sides, so this is
+        # not a one-sided restriction.
+        leg_option_type = (
+            OptionType.CALL if "C" in opt.contract_symbol else OptionType.PUT
+        )
+        dp = _direction_probability(snap, underlying)
+        bull_threshold = 0.50 + direction_mismatch_buffer
+        bear_threshold = 0.50 - direction_mismatch_buffer
+        if leg_option_type == OptionType.PUT and dp is not None and dp > bull_threshold:
+            if len(rejection_summary["direction_mismatch"]) < 8:
+                rejection_summary["direction_mismatch"].append(
+                    f"{opt.contract_symbol}:PUT vs dp={dp:.2f} (bullish)"
+                )
+            continue
+        if leg_option_type == OptionType.CALL and dp is not None and dp < bear_threshold:
+            if len(rejection_summary["direction_mismatch"]) < 8:
+                rejection_summary["direction_mismatch"].append(
+                    f"{opt.contract_symbol}:CALL vs dp={dp:.2f} (bearish)"
+                )
             continue
         # Heuristic input features for the scoring formula.
         direction_edge = _direction_edge(snap, underlying)
@@ -223,12 +331,23 @@ def _build_candidates(
         # Hackathon mandate: when this option came from a real ML
         # prediction (model_version starts with the option_h4 artifact
         # name) AND falls inside the strict DTE window we asked for, add
-        # a fixed boost so it reliably outscores the parallel long-equity
-        # candidate. The boost is NOT applied to heuristic-fallback rows
-        # (model_version = "heuristic-1") — those are placeholder rows
-        # the option ML path produced when its features were unavailable,
-        # and trading them would not exercise the option_h4 model the
-        # way the hackathon rubric expects.
+        # a fixed score boost so it reliably outscores the parallel
+        # long-equity candidate. The boost is NOT applied to
+        # heuristic-fallback rows (model_version = "heuristic-1") —
+        # those are placeholder rows the option ML path produced when
+        # its features were unavailable, and trading them would not
+        # exercise the option_h4 model the way the hackathon rubric
+        # expects.
+        #
+        # P0-1 fix: the boost is applied to the **score** only.
+        # Previously the same number was also added to the proposal's
+        # confidence so the candidate could clear the supervisor's
+        # confidence_min=0.50 gate even when probability_profitable
+        # was 0.37. That dressed up a sub-50% model output as a 67%
+        # confident trade and is the root cause of the 2026-09-03 AVGO
+        # long-put fill. The hard ``min_option_pp`` floor above is the
+        # real confidence gate now; the boost is just a tie-breaker
+        # between options and equity inside the score formula.
         model_version = str(opt.model_version or "")
         is_real_ml = (
             model_version.startswith("option_h4_")
@@ -237,20 +356,11 @@ def _build_candidates(
         in_strict_window = dte_min <= dte <= dte_max
         if option_mandate_boost and is_real_ml and in_strict_window:
             score = score + option_mandate_boost
-            # Confidence boost: the option's confidence is set to
-            # probability_profitable (~0.39-0.43 from option_h4), which
-            # fails the supervisor's confidence_min=0.50 gate. Without
-            # this, the option would always end up at NO_TRADE despite
-            # winning the score comparison. Bumping by
-            # option_mandate_boost (0.30) lands the option at ~0.69-0.73
-            # which clears the gate comfortably. Capped at 0.95 to keep
-            # the heuristic honest about the model's actual calibration.
-            boosted_conf = min(0.95, (proposal.confidence or 0.0) + option_mandate_boost)
             # Surface the boost on the thesis so the trace shows why
-            # this option outranked the equity leg.
+            # this option outranked the equity leg. Confidence is NOT
+            # touched here on purpose — see the long comment above.
             proposal = proposal.model_copy(update={
                 "thesis": proposal.thesis + f" [mandate+{option_mandate_boost:.2f}]",
-                "confidence": boosted_conf,
             })
         proposal = proposal.model_copy(update={"score": score})
         if score >= min_score:
@@ -261,7 +371,23 @@ def _build_candidates(
         # was widened. The note is informational, not a risk.
         if out:
             out[0] = out[0].model_copy(update={"thesis": out[0].thesis + f" [DTE fallback: {dte_fallback}]"})
-    return rank(out)[:top_n], dte_fallback
+    return rank(out)[:top_n], dte_fallback, rejection_summary
+
+
+def _direction_probability(snap, underlying: str) -> float | None:
+    """Read ``direction_probability`` for an underlying from the snapshot.
+    Returns ``None`` when missing (the caller treats that as "no signal"
+    and skips the direction-mismatch gate)."""
+    for u in snap.underlyings:
+        if u.symbol == underlying:
+            dp = getattr(u, "direction_probability", None)
+            if dp is None:
+                return None
+            try:
+                return float(dp)
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def _build_equity_candidates(
