@@ -255,10 +255,69 @@ class Orchestrator:
         from . import position_management as _pm
         _thresholds = _pm._load_thresholds(self.agents_cfg)
         preflight = _pm.PreFlightResult()
+
+        # (a0) Kill-switch latch check FIRST - before any broker call.
+        # If a previous tick on the same UTC day already tripped the
+        # kill-switch, the operator intent was "no new entries for the
+        # rest of today". Short-circuit before touching the broker so
+        # we don't waste a list_positions call on a day that's locked.
+        if _pm.is_kill_switch_latched_today(self.conn):
+            preflight.kill_switch_latched = True
+            state = DecisionState()
+            state.final_action = "NO_TRADE"
+            state.cycle_started_at = _now_iso()
+            state.cycle_completed_at = _now_iso()
+            state.execution_result = {
+                "status": "BLOCKED",
+                "reason": "daily_loss_kill_switch_latched",
+                "detail": preflight.as_dict(),
+            }
+            state.supplementary = {"position_management": preflight.as_dict()}
+            logger.warning(
+                "kill-switch latched earlier today; skipping cycle (no new entries)"
+            )
+            try:
+                self.journal.upsert(state)
+            except Exception as exc:  # pragma: no cover
+                logger.warning("kill-switch-latch journal upsert failed: %s", exc)
+            return state
+
+        # Broker portfolio fetch: fail-CLOSED. The previous behavior
+        # (return [] on any exception) silently disabled every
+        # position-management check, which would let the orchestrator
+        # open new positions even on a day when existing positions
+        # were past the stop-loss. We now short-circuit the cycle to
+        # NO_TRADE/BLOCKED if we cannot see the live portfolio.
+        from .alpaca_trading import AlpacaTradingClient
+        _broker_error: str | None = None
+        live_positions: list[Any] = []
         try:
-            live_positions = self.inference._load_portfolio()  # noqa: SLF001
-        except Exception:
-            live_positions = []
+            _client = AlpacaTradingClient()
+            live_positions = _client.list_positions() or []
+        except Exception as exc:  # noqa: BLE001
+            _broker_error = f"{type(exc).__name__}: {exc}"
+        if _broker_error is not None:
+            preflight.broker_unreachable = _broker_error
+            state = DecisionState()
+            state.final_action = "NO_TRADE"
+            state.cycle_started_at = _now_iso()
+            state.cycle_completed_at = _now_iso()
+            state.execution_result = {
+                "status": "BLOCKED",
+                "reason": "broker_unreachable",
+                "detail": {"error": _broker_error},
+            }
+            state.supplementary = {"position_management": preflight.as_dict()}
+            logger.error(
+                "broker portfolio fetch failed; cycle fail-closed: %s",
+                _broker_error,
+            )
+            try:
+                self.journal.upsert(state)
+            except Exception as exc:  # pragma: no cover
+                logger.warning("broker-unreachable journal upsert failed: %s", exc)
+            return state
+
         # (a) Daily loss kill-switch.
         try:
             from .journal import _today_realized_pnl
@@ -272,6 +331,14 @@ class Orchestrator:
             pct=_thresholds["daily_loss_kill_switch_pct"],
         )
         if preflight.kill_switch.breached:
+            # Latch the trip so subsequent ticks today cannot re-enter.
+            _pm.record_kill_switch_latch(
+                self.conn,
+                total_pnl=preflight.kill_switch.total_pnl,
+                threshold_usd=preflight.kill_switch.threshold_usd,
+                pct=preflight.kill_switch.pct,
+            )
+            preflight.kill_switch_latched = True
             state = DecisionState()
             state.final_action = "NO_TRADE"
             state.cycle_started_at = _now_iso()
@@ -295,14 +362,26 @@ class Orchestrator:
             except Exception as exc:  # pragma: no cover
                 logger.warning("kill-switch journal upsert failed: %s", exc)
             return state
+        # (a1) Early warning. -25% (configurable) loss is halfway to
+        # the -50% stop-loss. Log a WARNING per position so the
+        # operator can see it on the cron trace; record the list in
+        # preflight.early_warnings so the journal row also reflects it.
+        preflight.early_warnings = _pm.early_warning_positions(
+            live_positions, pct=_thresholds["early_warning_pct"],
+        )
+        for w in preflight.early_warnings:
+            logger.warning(
+                "early-warning: %s at loss_pct=%.2f%% unrealized_pnl=%.2f "
+                "(halfway to %.0f%% stop-loss)",
+                w["symbol"], w["loss_pct"] * 100, w["unrealized_pnl"],
+                abs(_thresholds["stop_loss_pct"]) * 100,
+            )
         # (b) Auto-close per-position stop-losses. Side effect, no state
         # change to the cycle result. Failures are logged but do not
         # abort the cycle (a broker outage is non-fatal).
         try:
-            from .alpaca_trading import AlpacaTradingClient
-            client = AlpacaTradingClient()
             preflight.stop_loss_closes = _pm.auto_close_stop_loss(
-                client, live_positions,
+                _client, live_positions,
                 pct=_thresholds["stop_loss_pct"],
             )
         except Exception as exc:  # noqa: BLE001

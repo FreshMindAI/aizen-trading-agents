@@ -46,6 +46,7 @@ import logging
 import os
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,13 @@ def _load_thresholds(agents_cfg: dict[str, Any] | None = None) -> dict[str, floa
         "open_loss_block_pct": _env_float(
             "AIZEN_OPEN_LOSS_BLOCK_PCT",
             float(cfg_pm.get("open_loss_block_pct", -0.05)),
+        ),
+        # Early-warning threshold: log a WARNING (no auto-close) when a
+        # position crosses this loss fraction, halfway to the stop-loss
+        # default. Gives the operator a visible signal before disaster.
+        "early_warning_pct": _env_float(
+            "AIZEN_EARLY_WARNING_PCT",
+            float(cfg_pm.get("early_warning_pct", -0.25)),
         ),
     }
 
@@ -221,14 +229,71 @@ def positions_to_close(
     return out
 
 
+def early_warning_positions(
+    positions: Iterable[Any],
+    *,
+    pct: float = -0.25,
+) -> list[dict[str, Any]]:
+    """Return positions whose loss is worse than ``pct`` of cost basis but
+    has not yet crossed the -50% stop-loss threshold. These are pure
+    warnings — no auto-close fires — but they give the operator a
+    visible signal ~halfway to disaster so they can intervene before
+    the -50% cutoff is reached.
+
+    The same dict shape as :func:`positions_to_close` is returned so
+    the caller can log uniformly. A position that would also be
+    returned by :func:`positions_to_close` is *excluded* here (the
+    stop-loss auto-close is the louder signal; warning is for the
+    "we still have time to act" zone).
+    """
+    out: list[dict[str, Any]] = []
+    for p in positions:
+        if isinstance(p, dict):
+            symbol = p.get("symbol")
+            qty = float(p.get("qty") or p.get("quantity") or 0)
+            entry = float(p.get("avg_entry_price") or p.get("entry_price") or 0)
+            mark = float(p.get("current_price") or p.get("mark_price") or entry)
+            upl = float(p.get("unrealized_pl") or p.get("unrealized_pnl") or
+                        ((mark - entry) * qty))
+        else:
+            symbol = getattr(p, "symbol", None)
+            qty = float(getattr(p, "quantity", 0) or 0)
+            entry = float(getattr(p, "entry_price", 0) or 0)
+            mark = float(getattr(p, "current_price", None) or
+                         getattr(p, "mark_price", 0) or entry)
+            upl = float(getattr(p, "unrealized_pnl", None) or
+                        ((mark - entry) * qty))
+        if not symbol or qty == 0 or entry <= 0:
+            continue
+        loss_pct = upl / (entry * abs(qty))
+        # Only the "early" zone: between warning and stop-loss.
+        if loss_pct <= pct and loss_pct > -0.50:
+            out.append({
+                "symbol": symbol,
+                "quantity": int(abs(qty)),
+                "entry_price": entry,
+                "current_price": mark,
+                "unrealized_pnl": upl,
+                "loss_pct": loss_pct,
+            })
+    return out
+
+
 def auto_close_stop_loss(client, positions: Iterable[Any], *,
                         pct: float = -0.50) -> list[dict[str, Any]]:
     """Market-close every position whose loss exceeds ``pct`` of cost basis.
 
     Returns a list of close results, one per position. Each result is
-    ``{"symbol": ..., "status": "closed"|"error", "broker_order_id": ...,
-    "error": ...}``. The caller is expected to log this and write it
-    into ``state.execution_result`` for the journal.
+    ``{"symbol": ..., "status": "closed"|"already_closed"|"error",
+    "broker_order_id": ..., "error": ...}``. The caller is expected to
+    log this and write it into ``state.execution_result`` for the journal.
+
+    Idempotency: a 404 from the broker (the position was closed by
+    another path between our snapshot and this call, or a stale local
+    position list) is logged as ``already_closed`` not ``error``. The
+    operator's intent (position is closed) is achieved, so the
+    WARNING-level log that would fire on a real failure is suppressed
+    in favor of an INFO line.
     """
     to_close = positions_to_close(positions, pct=pct)
     out: list[dict[str, Any]] = []
@@ -248,12 +313,28 @@ def auto_close_stop_loss(client, positions: Iterable[Any], *,
                 sym, pos["loss_pct"] * 100, pos["unrealized_pnl"],
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("stop-loss close failed for %s: %s: %s",
-                           sym, type(exc).__name__, exc)
+            # 404 / "no position" => already closed by another path. Treat
+            # as success for cycle purposes (the desired state is achieved);
+            # the next refresh will drop the position from the live list.
+            msg = f"{type(exc).__name__}: {exc}"
+            if "404" in msg or "position does not exist" in msg.lower() \
+                    or "not found" in msg.lower():
+                logger.info(
+                    "stop-loss: %s already closed by another path (%s)",
+                    sym, msg,
+                )
+                out.append({
+                    "symbol": sym,
+                    "status": "already_closed",
+                    "loss_pct": pos["loss_pct"],
+                    "unrealized_pnl": pos["unrealized_pnl"],
+                })
+                continue
+            logger.warning("stop-loss close failed for %s: %s", sym, msg)
             out.append({
                 "symbol": sym,
                 "status": "error",
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": msg,
             })
     return out
 
@@ -367,10 +448,101 @@ class PreFlightResult:
     kill_switch: KillSwitchResult | None = None
     stop_loss_closes: list[dict[str, Any]] = field(default_factory=list)
     blocked_symbols: set[str] = field(default_factory=set)
+    early_warnings: list[dict[str, Any]] = field(default_factory=list)
+    kill_switch_latched: bool = False
+    broker_unreachable: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "kill_switch": self.kill_switch.as_dict() if self.kill_switch else None,
             "stop_loss_closes": self.stop_loss_closes,
             "blocked_symbols": sorted(self.blocked_symbols),
+            "early_warnings": self.early_warnings,
+            "kill_switch_latched": self.kill_switch_latched,
+            "broker_unreachable": self.broker_unreachable,
         }
+
+
+# ---------------------------------------------------------------------------
+# (d) Daily kill-switch latch
+#
+# The kill-switch is per-tick, not per-day. If it trips at 11:00 ET,
+# realized P/L stops being negative at 15:00 ET (because the stop-loss
+# closed the worst positions), the next tick would see total P/L back
+# above the cap and the kill-switch would NOT re-fire. But the operator
+# intent was "no new entries for the rest of today". Persist the trip
+# in the ``kill_switch_latch`` table for the UTC day; the next tick
+# reads it and short-circuits to NO_TRADE without re-running the
+# math. Cleared implicitly by the date-based primary key (a new
+# calendar day = a new row).
+# ---------------------------------------------------------------------------
+def _latch_table_ready(conn: sqlite3.Connection) -> bool:
+    """Return True iff the ``kill_switch_latch`` table exists.
+
+    Older DBs may predate sql/71_kill_switch_latch.sql; tests that
+    build a minimal schema without running the full migration set
+    will hit this path. A fresh ``init_db`` on a normal DB will
+    always have it.
+    """
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kill_switch_latch'"
+        ).fetchone()
+        return row is not None
+    except Exception:  # pragma: no cover
+        return False
+
+
+def is_kill_switch_latched_today(
+    conn: sqlite3.Connection | None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Return True iff a kill-switch trip has been recorded for today's
+    UTC date. ``conn=None`` returns False (no DB = no latch); the
+    caller is expected to handle that as "proceed normally"."""
+    if conn is None or not _latch_table_ready(conn):
+        return False
+    if now is None:
+        now = datetime.now(timezone.utc)
+    day_prefix = now.strftime("%Y-%m-%d")
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM kill_switch_latch WHERE day_utc = ?",
+            (day_prefix,),
+        ).fetchone()
+        return row is not None
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("kill_switch_latch read failed: %s: %s",
+                       type(exc).__name__, exc)
+        return False
+
+
+def record_kill_switch_latch(
+    conn: sqlite3.Connection | None,
+    *,
+    total_pnl: float,
+    threshold_usd: float,
+    pct: float,
+    now: datetime | None = None,
+) -> None:
+    """Persist a kill-switch trip for the current UTC day. Idempotent
+    (re-recording overwrites the snapshot). No-op if conn is None or
+    the table is missing."""
+    if conn is None or not _latch_table_ready(conn):
+        return
+    if now is None:
+        now = datetime.now(timezone.utc)
+    day_prefix = now.strftime("%Y-%m-%d")
+    iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO kill_switch_latch "
+            "(day_utc, breached_at, total_pnl, threshold_usd, pct) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (day_prefix, iso, float(total_pnl), float(threshold_usd), float(pct)),
+        )
+        conn.commit()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("kill_switch_latch write failed: %s: %s",
+                       type(exc).__name__, exc)
