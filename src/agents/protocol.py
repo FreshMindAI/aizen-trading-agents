@@ -301,6 +301,15 @@ class DecisionState(StrictModel):
     risk_decision: RiskDecision | None = None
     order_intent: OrderIntent | None = None
     execution_result: dict[str, Any] | None = None
+    # MCP preflight summary written by the execution node
+    # (:mod:`src.agents.nodes.execution`). ``called=False`` means the
+    # in-process MCP SkillRegistry was not exercised (e.g. skills=None
+    # on older test paths or a NO_TRADE cycle that never reached the
+    # execution node). When ``called=True`` the dict carries either
+    # ``n_positions`` (int) or ``error`` (str). Recorded in the cycle
+    # trace + journal so the operator can confirm the MCP wiring
+    # actually ran on every PROCEED cycle, not just compiled.
+    mcp_preflight: dict[str, Any] | None = None
 
     final_action: Literal["PROCEED", "REDUCE", "REJECT", "NO_TRADE"] = "NO_TRADE"
     realized_pnl: float | None = None
