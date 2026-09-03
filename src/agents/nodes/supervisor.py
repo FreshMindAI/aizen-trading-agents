@@ -62,13 +62,23 @@ def build_node(llm, config: dict[str, Any], risk_limits, *, skills=None):
         # conflict / confidence gates so we never re-enter a loser.
         blocked = _blocked_symbols(state)
         if blocked:
+            # Log the blocked set at the top of every cycle so the
+            # operator can see it in the cron stdout (not buried
+            # inside the LangGraph state). Promoted to WARNING
+            # because "we are about to skip a candidate because the
+            # underlying is in loss" is the single most important
+            # operator signal in the run loop.
+            logger.warning(
+                "supervisor blocked_symbols: %s", sorted(blocked),
+            )
             before = len(candidates)
             candidates = [c for c in candidates
                           if (c.underlying or "").split(" ")[0].upper()
                           not in blocked]
             if len(candidates) < before:
-                logger.info(
-                    "supervisor filtered %d candidate(s) on blocked symbols: %s",
+                logger.warning(
+                    "supervisor filtered %d candidate(s) on blocked "
+                    "symbols: %s",
                     before - len(candidates), sorted(blocked),
                 )
             if not candidates:

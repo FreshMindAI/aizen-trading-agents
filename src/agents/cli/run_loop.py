@@ -135,6 +135,17 @@ def _refresh_data(orch) -> dict[str, int]:
                 "option contracts populated: %d symbols, %d contracts",
                 len(n_contracts), sum(n_contracts.values()),
             )
+        else:
+            # populate_option_contracts returns {} on broker errors. The
+            # function is silent on failure by design (a broker outage
+            # must not fail the cycle), but the operator needs a clear
+            # signal that the option path is going to fall through to
+            # the no_dte_data heuristic. This WARNING is the at-a-glance
+            # "options won't trade this cycle" marker.
+            logger.warning(
+                "option contracts NOT populated (broker error or no chain); "
+                "options_structure_agent will return candidates_returned=0"
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Option contract populate failed: %s: %s",
                        type(exc).__name__, exc)
@@ -182,6 +193,23 @@ def _print_summary(state, n_refreshed: int, started_at: str, started_at_epoch: f
     print(f"  order_legs    : {n_legs}")
     print(f"  exec_status   : {exec_status}")
     print(f"  cycle_started : {state.cycle_started_at}")
+    # Surface the blocked_symbols set the supervisor used to filter
+    # candidates. Operators want this visible in the cron stdout so
+    # they can see at a glance "we filtered AVGO because it's already
+    # in loss" rather than having to dig into the cycle trace.
+    _pm = (state.supplementary or {}).get("position_management") or {}
+    _blocked = _pm.get("blocked_symbols") or []
+    if _blocked:
+        print(f"  blocked       : {sorted(_blocked)}")
+    _early = _pm.get("early_warnings") or []
+    if _early:
+        syms = sorted({w.get("symbol", "?") for w in _early})
+        worst = min((w.get("loss_pct", 0.0) for w in _early), default=0.0)
+        print(f"  early_warn    : {syms} (worst loss_pct={worst*100:.1f}%)")
+    _stops = _pm.get("stop_loss_closes") or []
+    if _stops:
+        syms = sorted({s.get("symbol", "?") for s in _stops})
+        print(f"  stopped       : {syms} (auto-closed by stop-loss)")
     # On PROCEED, this is the "next-day plan" the operator reads before
     # the next market open. On NO_TRADE, print the highest-scoring
     # candidate so the operator can see what *almost* traded.
@@ -232,6 +260,16 @@ def run_once() -> int:
     try:
         orch = Orchestrator(conn=conn)
         n_refreshed = _refresh_data(orch)
+        # Post-refresh data-state log. The startup line above was the
+        # BEFORE state; this line shows what the refresh actually
+        # delivered. If option_contracts is still 0 here, the WARNING
+        # above is the only signal the operator has that no options
+        # will trade this cycle.
+        try:
+            _log_startup_data_state(conn, label="data_state_after_refresh")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("post-refresh data-state log failed: %s: %s",
+                           type(exc).__name__, exc)
         state = orch.run_cycle()
         _print_summary(state, n_refreshed, started, started_epoch)
         # Rebuild the static dashboard after every cycle. Cheap (~100ms
@@ -251,7 +289,7 @@ def run_once() -> int:
     return 0
 
 
-def _log_startup_data_state(conn) -> None:
+def _log_startup_data_state(conn, label: str = "data_state") -> None:
     """Emit one INFO line summarizing the live data state at cycle start.
 
     Why this exists: the operator's most common debugging question after
@@ -268,6 +306,12 @@ def _log_startup_data_state(conn) -> None:
       * a fresh news snapshot (the news-pre-tick workflow runs every
         15 min; a stale timestamp here means news is missing or the
         workflow is broken)
+
+    ``label`` is the leading key on the log line (default ``data_state``
+    for the BEFORE line, ``data_state_after_refresh`` for the AFTER
+    line emitted after _refresh_data() finishes). The two-line form
+    gives the operator a clear before/after diff of what the cron
+    tick actually accomplished.
 
     Format (single line, fixed-width labels for grep-ability)::
 
@@ -323,13 +367,45 @@ def _log_startup_data_state(conn) -> None:
     )
     dte_str = str(option_dte_max) if option_dte_max is not None else "?"
     logger.info(
-        "data_state llm=%s underlying_bars=%d option_contracts=%d "
+        "%s llm=%s underlying_bars=%d option_contracts=%d "
         "option_bars=%d news_snapshot=%d news_last=%s news_age_min=%s "
         "option_dte_max=%s",
-        llm_provider, underlying_bars, option_contracts,
+        label, llm_provider, underlying_bars, option_contracts,
         option_bars, news_snapshot, news_last_iso or "(none)",
         news_age_str, dte_str,
     )
+    # High-visibility WARNING when the option path is guaranteed to
+    # fall through to no_dte_data. The cron-loop.yml operator can then
+    # tell at a glance that no option trade is possible this cycle,
+    # even without grepping for the data_state line. Two triggers:
+    #   (a) option_contracts == 0 -- the populate step never wrote rows
+    #       (broker error / no chain for today).
+    #   (b) option_dte_max <= 0 -- rows exist but every contract is
+    #       already expired (data was populated for a past session).
+    # Both surface the same NO_TRADE outcome so the operator gets a
+    # single clear signal.
+    if option_contracts == 0 or (option_dte_max is not None and option_dte_max <= 0):
+        reason = (
+            f"no option_contracts in DB" if option_contracts == 0
+            else f"all option_contracts expired (max DTE={option_dte_max})"
+        )
+        logger.warning(
+            "no tradable options: %s. options_structure_agent will return "
+            "candidates_returned=0 and dte_fallback=no_dte_data. This usually "
+            "means populate_option_contracts() couldn't reach Alpaca OR the "
+            "chain is empty for today (weekend / holiday / after-hours).",
+            reason,
+        )
+    # Stale news is the other common cause of a low GNN bias and
+    # NO_TRADE. Flag when the news-pre-tick workflow hasn't refreshed
+    # in over 30 min (two cron cycles).
+    if news_age_min is not None and news_age_min > 30:
+        logger.warning(
+            "stale news: last news_snapshot was %d min ago "
+            "(news-pre-tick workflow may be broken or throttled). "
+            "GNN bias is being computed against outdated sentiment.",
+            news_age_min,
+        )
 
 
 def _rebuild_dashboard() -> None:

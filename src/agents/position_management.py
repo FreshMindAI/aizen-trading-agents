@@ -558,6 +558,26 @@ def get_blocked_symbols(
     determinism.
     """
     blocked: set[str] = set()
+    # Defense in depth: if the broker returned an empty list, the
+    # operator cannot tell "I really have no positions" from "broker
+    # silently failed". The 2026-09-03 cloud cron run was the
+    # canonical example: list_positions() returned [] with no
+    # exception, the open-loss check found nothing, and the
+    # supervisor re-entered AVGO while the live portfolio still
+    # held two losing AVGO puts. Emit a WARNING so the operator
+    # sees the position-management layer is operating blind.
+    # The orchestrator's pre-flight already short-circuits to
+    # NO_TRADE/BLOCKED on a real exception (graph.py fail-closed
+    # path); this is the equivalent signal for the silent-empty
+    # case.
+    if not list(positions or []):
+        logger.warning(
+            "get_blocked_symbols called with empty positions list - "
+            "broker may have silently failed. Open-loss and stop-loss "
+            "checks are operating on an empty portfolio; do not trust "
+            "a NO_TRADE-on-cooldown result until the broker is "
+            "verified reachable."
+        )
     # (i) Open positions in loss.
     for pos in positions:
         fields = _extract_position_fields(pos)
