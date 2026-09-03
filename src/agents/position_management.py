@@ -187,6 +187,98 @@ def check_daily_loss_kill_switch(
 
 
 # ---------------------------------------------------------------------------
+# Symbol classification + loss-pct math
+# ---------------------------------------------------------------------------
+def _is_option_symbol(symbol: str | None) -> bool:
+    """Return True iff ``symbol`` looks like an OCC option contract.
+
+    Equities are 1-5 uppercase letters (e.g. ``AAPL``, ``SPY``, ``GOOGL``).
+    OCC option symbols embed a 6-digit date and 8-digit strike multiplier
+    after the underlying ticker (e.g. ``COIN260911P00175000``,
+    ``SPY260304C00450000``), so any symbol with a digit, or length >= 6,
+    is treated as an option.
+
+    Why this matters: for an option, 1 contract represents 100 shares.
+    The broker's ``unrealized_pl`` field reports the total dollar P/L for
+    the position, but our per-share ``entry`` value times ``qty`` (contracts)
+    is NOT the total dollar cost basis. Mixing those two scales was the
+    2026-09-03 production bug that produced ``loss_pct=-5721.31%`` in
+    the cron log (see ``tests/test_position_management_hardening.py``).
+    """
+    if not symbol:
+        return False
+    if len(symbol) >= 6:
+        return True
+    return any(c.isdigit() for c in symbol)
+
+
+def _compute_loss_pct(mark: float, entry: float) -> float:
+    """Return the unit-consistent loss_pct as a fraction.
+
+    The formula is ``(mark - entry) / entry``: both numerator and
+    denominator are per-share (or per-contract when the symbol is a
+    contract and entry/mark are contract-sized), so the result is
+    always a fraction in the rough range ``[-1.0, +inf)``.
+
+    The broker's ``unrealized_pl`` field is NOT used here because for
+    options it is reported in total dollars (1 contract = 100 shares)
+    while our ``entry`` and ``qty`` are per-share / per-contract —
+    dividing one by the other gave a 100x-blown-up ratio.
+    """
+    if entry <= 0:
+        return 0.0
+    return (mark - entry) / entry
+
+
+def _recompute_unrealized_pnl(
+    mark: float, entry: float, qty: float, symbol: str | None,
+) -> float:
+    """Return the per-position dollar P/L recomputed from (mark, entry).
+
+    For an option, ``qty`` is the number of contracts and 1 contract
+    represents 100 shares, so the total dollar P/L is multiplied by
+    100. For an equity, ``qty`` is the number of shares (no multiplier).
+    This is the fallback when the broker's ``unrealized_pl`` field is
+    missing; the broker's value is preferred when present.
+    """
+    per_unit = (mark - entry) * qty
+    if _is_option_symbol(symbol):
+        return per_unit * 100
+    return per_unit
+
+
+def _extract_position_fields(p: Any) -> dict[str, Any] | None:
+    """Return ``{symbol, qty, entry, mark, broker_upl}`` for either a
+    dict or an object position. Returns None when required fields are
+    missing or invalid so the caller can skip the position.
+    """
+    if isinstance(p, dict):
+        symbol = p.get("symbol")
+        qty = float(p.get("qty") or p.get("quantity") or 0)
+        entry = float(p.get("avg_entry_price") or p.get("entry_price") or 0)
+        mark = float(p.get("current_price") or p.get("mark_price") or entry)
+        broker_upl = p.get("unrealized_pl")
+        if broker_upl is None:
+            broker_upl = p.get("unrealized_pnl")
+    else:
+        symbol = getattr(p, "symbol", None)
+        qty = float(getattr(p, "quantity", 0) or 0)
+        entry = float(getattr(p, "entry_price", 0) or 0)
+        mark = float(getattr(p, "current_price", None) or
+                     getattr(p, "mark_price", 0) or entry)
+        broker_upl = getattr(p, "unrealized_pnl", None)
+    if not symbol or qty == 0 or entry <= 0:
+        return None
+    return {
+        "symbol": symbol,
+        "qty": qty,
+        "entry": entry,
+        "mark": mark,
+        "broker_upl": float(broker_upl) if broker_upl is not None else None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # (b) Per-position stop-loss
 # ---------------------------------------------------------------------------
 def positions_to_close(
@@ -200,36 +292,34 @@ def positions_to_close(
     Each returned dict has ``symbol``, ``quantity``, ``entry_price``,
     ``current_price``, ``unrealized_pnl``, and ``loss_pct`` so the caller
     can either log them or pass to :meth:`AlpacaTradingClient.close_position`.
+
+    ``loss_pct`` is computed from ``(mark - entry) / entry`` — see
+    :func:`_compute_loss_pct` for the rationale (the broker's
+    ``unrealized_pl`` field is in total dollars while our cost basis
+    is per-share, so using the broker's field for the ratio produced
+    100x-blown-up values in production for option contracts).
     """
     out: list[dict[str, Any]] = []
     for p in positions:
-        if isinstance(p, dict):
-            symbol = p.get("symbol")
-            qty = float(p.get("qty") or p.get("quantity") or 0)
-            entry = float(p.get("avg_entry_price") or p.get("entry_price") or 0)
-            mark = float(p.get("current_price") or p.get("mark_price") or entry)
-            upl = float(p.get("unrealized_pl") or p.get("unrealized_pnl") or
-                        ((mark - entry) * qty))
-        else:
-            symbol = getattr(p, "symbol", None)
-            qty = float(getattr(p, "quantity", 0) or 0)
-            entry = float(getattr(p, "entry_price", 0) or 0)
-            mark = float(getattr(p, "current_price", None) or
-                         getattr(p, "mark_price", 0) or entry)
-            upl = float(getattr(p, "unrealized_pnl", None) or
-                        ((mark - entry) * qty))
-        if not symbol or qty == 0 or entry <= 0:
+        fields = _extract_position_fields(p)
+        if fields is None:
             continue
-        loss_pct = upl / (entry * qty)
-        if loss_pct <= pct:  # pct is negative; -0.50 means "loss >= 50%"
-            out.append({
-                "symbol": symbol,
-                "quantity": int(abs(qty)),
-                "entry_price": entry,
-                "current_price": mark,
-                "unrealized_pnl": upl,
-                "loss_pct": loss_pct,
-            })
+        loss_pct = _compute_loss_pct(fields["mark"], fields["entry"])
+        if loss_pct > pct:  # pct is negative; -0.50 means "loss >= 50%"
+            continue
+        upl = (fields["broker_upl"]
+               if fields["broker_upl"] is not None
+               else _recompute_unrealized_pnl(
+                   fields["mark"], fields["entry"],
+                   fields["qty"], fields["symbol"]))
+        out.append({
+            "symbol": fields["symbol"],
+            "quantity": int(abs(fields["qty"])),
+            "entry_price": fields["entry"],
+            "current_price": fields["mark"],
+            "unrealized_pnl": upl,
+            "loss_pct": loss_pct,
+        })
     return out
 
 
@@ -253,34 +343,26 @@ def early_warning_positions(
     """
     out: list[dict[str, Any]] = []
     for p in positions:
-        if isinstance(p, dict):
-            symbol = p.get("symbol")
-            qty = float(p.get("qty") or p.get("quantity") or 0)
-            entry = float(p.get("avg_entry_price") or p.get("entry_price") or 0)
-            mark = float(p.get("current_price") or p.get("mark_price") or entry)
-            upl = float(p.get("unrealized_pl") or p.get("unrealized_pnl") or
-                        ((mark - entry) * qty))
-        else:
-            symbol = getattr(p, "symbol", None)
-            qty = float(getattr(p, "quantity", 0) or 0)
-            entry = float(getattr(p, "entry_price", 0) or 0)
-            mark = float(getattr(p, "current_price", None) or
-                         getattr(p, "mark_price", 0) or entry)
-            upl = float(getattr(p, "unrealized_pnl", None) or
-                        ((mark - entry) * qty))
-        if not symbol or qty == 0 or entry <= 0:
+        fields = _extract_position_fields(p)
+        if fields is None:
             continue
-        loss_pct = upl / (entry * abs(qty))
+        loss_pct = _compute_loss_pct(fields["mark"], fields["entry"])
         # Only the "early" zone: between warning and stop-loss.
-        if loss_pct <= pct and loss_pct > stop_loss_pct:
-            out.append({
-                "symbol": symbol,
-                "quantity": int(abs(qty)),
-                "entry_price": entry,
-                "current_price": mark,
-                "unrealized_pnl": upl,
-                "loss_pct": loss_pct,
-            })
+        if not (loss_pct <= pct and loss_pct > stop_loss_pct):
+            continue
+        upl = (fields["broker_upl"]
+               if fields["broker_upl"] is not None
+               else _recompute_unrealized_pnl(
+                   fields["mark"], fields["entry"],
+                   fields["qty"], fields["symbol"]))
+        out.append({
+            "symbol": fields["symbol"],
+            "quantity": int(abs(fields["qty"])),
+            "entry_price": fields["entry"],
+            "current_price": fields["mark"],
+            "unrealized_pnl": upl,
+            "loss_pct": loss_pct,
+        })
     return out
 
 
@@ -301,33 +383,25 @@ def profit_take_positions(
     """
     out: list[dict[str, Any]] = []
     for p in positions:
-        if isinstance(p, dict):
-            symbol = p.get("symbol")
-            qty = float(p.get("qty") or p.get("quantity") or 0)
-            entry = float(p.get("avg_entry_price") or p.get("entry_price") or 0)
-            mark = float(p.get("current_price") or p.get("mark_price") or entry)
-            upl = float(p.get("unrealized_pl") or p.get("unrealized_pnl") or
-                        ((mark - entry) * qty))
-        else:
-            symbol = getattr(p, "symbol", None)
-            qty = float(getattr(p, "quantity", 0) or 0)
-            entry = float(getattr(p, "entry_price", 0) or 0)
-            mark = float(getattr(p, "current_price", None) or
-                         getattr(p, "mark_price", 0) or entry)
-            upl = float(getattr(p, "unrealized_pnl", None) or
-                        ((mark - entry) * qty))
-        if not symbol or qty == 0 or entry <= 0:
+        fields = _extract_position_fields(p)
+        if fields is None:
             continue
-        gain_pct = upl / (entry * abs(qty))
-        if gain_pct >= pct:  # pct is positive; 0.50 means "gain >= 50%"
-            out.append({
-                "symbol": symbol,
-                "quantity": int(abs(qty)),
-                "entry_price": entry,
-                "current_price": mark,
-                "unrealized_pnl": upl,
-                "gain_pct": gain_pct,
-            })
+        gain_pct = _compute_loss_pct(fields["mark"], fields["entry"])
+        if gain_pct < pct:  # pct is positive; 0.50 means "gain >= 50%"
+            continue
+        upl = (fields["broker_upl"]
+               if fields["broker_upl"] is not None
+               else _recompute_unrealized_pnl(
+                   fields["mark"], fields["entry"],
+                   fields["qty"], fields["symbol"]))
+        out.append({
+            "symbol": fields["symbol"],
+            "quantity": int(abs(fields["qty"])),
+            "entry_price": fields["entry"],
+            "current_price": fields["mark"],
+            "unrealized_pnl": upl,
+            "gain_pct": gain_pct,
+        })
     return out
 
 
@@ -486,22 +560,10 @@ def get_blocked_symbols(
     blocked: set[str] = set()
     # (i) Open positions in loss.
     for pos in positions:
-        if isinstance(pos, dict):
-            qty = float(pos.get("qty") or pos.get("quantity") or 0)
-            entry = float(pos.get("avg_entry_price") or pos.get("entry_price") or 0)
-            mark = float(pos.get("current_price") or pos.get("mark_price") or entry)
-            upl = float(pos.get("unrealized_pl") or pos.get("unrealized_pnl") or
-                        ((mark - entry) * qty))
-        else:
-            qty = float(getattr(pos, "quantity", 0) or 0)
-            entry = float(getattr(pos, "entry_price", 0) or 0)
-            mark = float(getattr(pos, "current_price", None) or
-                         getattr(pos, "mark_price", 0) or entry)
-            upl = float(getattr(pos, "unrealized_pnl", None) or
-                        ((mark - entry) * qty))
-        if qty == 0 or entry <= 0:
+        fields = _extract_position_fields(pos)
+        if fields is None:
             continue
-        loss_pct = upl / (entry * abs(qty))
+        loss_pct = _compute_loss_pct(fields["mark"], fields["entry"])
         if loss_pct <= open_loss_block_pct:
             ul = underlying_of_position(pos)
             if ul:

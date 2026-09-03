@@ -381,6 +381,166 @@ def test_load_thresholds_default_profit_take_is_50pct():
 
 
 # ---------------------------------------------------------------------------
+# Regression: 2026-09-03 GH Actions log — cents-vs-dollars unit mismatch
+# ---------------------------------------------------------------------------
+def test_loss_pct_ignores_broker_unrealized_pl_unit_mismatch():
+    """Pin the unit-consistent loss_pct math for option positions.
+
+    The 2026-09-03 cron run logged
+    ``stop-loss closed COIN260911P00175000 @ loss_pct=-5721.31%``
+    when the actual position loss was -57% (mark=2.61, entry=6.10,
+    qty=1 contract of an option — true per-share P/L -$3.49, true
+    per-contract P/L -$349). The bug was that the old code computed
+    ``loss_pct = broker_unrealized_pl / (entry * qty)`` and the
+    broker's field is in total dollars (1 contract = 100 shares)
+    while ``entry * qty`` is per-share, so the ratio was 100x too
+    large.
+
+    The fix: ``loss_pct = (mark - entry) / entry``. Both numerator
+    and denominator are per-share, so the result is unit-consistent
+    regardless of contract multiplier. The broker's ``unrealized_pl``
+    is still preserved as the ``unrealized_pnl`` field for operator
+    display.
+    """
+    pos = {
+        "symbol": "COIN260911P00175000",  # OCC option
+        "qty": 1,
+        "avg_entry_price": 6.10,
+        "current_price": 2.61,  # mid-move; true per-share loss = -3.49
+        "unrealized_pl": -349.00,  # broker's field — total dollars, 100x off
+    }
+    out = pm.positions_to_close([pos], pct=-0.30)
+    # The position is past -30% so it should be returned.
+    assert len(out) == 1
+    rec = out[0]
+    # loss_pct must be the per-share ratio, ~ -57.2%, NOT -5721%.
+    assert rec["loss_pct"] == pytest.approx((2.61 - 6.10) / 6.10)
+    assert -0.60 < rec["loss_pct"] < -0.55, (
+        f"loss_pct={rec['loss_pct']!r} is not in the expected -57% range; "
+        "the broker's unrealized_pl unit mismatch is back."
+    )
+    # The dollar P/L field still shows the broker's actual value for
+    # operator display (-$349 total, not -$3.49 per share).
+    assert rec["unrealized_pnl"] == -349.00
+
+
+def test_loss_pct_works_for_equities_with_consistent_broker_field():
+    """Equities don't have the 100x contract multiplier, so the broker's
+    ``unrealized_pl`` and the per-share entry*qty denominator are
+    in the same units. The new math still gives the right answer.
+    """
+    pos = {
+        "symbol": "AAPL",  # equity, not OCC
+        "qty": 10,
+        "avg_entry_price": 150.0,
+        "current_price": 145.0,  # -$5/share, -$50 total
+        "unrealized_pl": -50.0,  # broker's field matches the math
+    }
+    out = pm.positions_to_close([pos], pct=-0.02)
+    assert len(out) == 1
+    rec = out[0]
+    assert rec["loss_pct"] == pytest.approx((145.0 - 150.0) / 150.0)
+    assert rec["unrealized_pnl"] == -50.0
+
+
+def test_loss_pct_works_without_broker_unrealized_pl_field():
+    """When the broker doesn't return ``unrealized_pl``, the fallback
+    uses the per-share recompute (×100 for options, ×1 for equities)."""
+    pos = {
+        "symbol": "SPY260304P00450000",  # OCC option
+        "qty": 2,  # 2 contracts
+        "avg_entry_price": 5.00,
+        "current_price": 4.00,  # -$1/share, -$100/contract, -$200 total
+        # No unrealized_pl / unrealized_pnl field.
+    }
+    out = pm.positions_to_close([pos], pct=-0.10)
+    assert len(out) == 1
+    rec = out[0]
+    assert rec["loss_pct"] == pytest.approx(-0.20)
+    # 2 contracts × 100 shares × -$1 = -$200 total.
+    assert rec["unrealized_pnl"] == pytest.approx(-200.0)
+
+
+def test_early_warning_loss_pct_uses_unit_consistent_math():
+    """The early-warning path also fixed: an option with broker
+    unrealized_pl that's 100x off should still produce a sane
+    loss_pct, not a 100x-blown-up one."""
+    pos = {
+        "symbol": "META260909P00592500",  # OCC option
+        "qty": 1,
+        "avg_entry_price": 2.16,
+        "current_price": 1.20,  # -$0.96/share, ~ -44% loss
+        "unrealized_pl": -96.0,  # broker 100x off
+    }
+    out = pm.early_warning_positions([pos], pct=-0.30, stop_loss_pct=-0.50)
+    assert len(out) == 1
+    rec = out[0]
+    # ~ -44% loss, in the early-warning zone (between -30% and -50%).
+    assert rec["loss_pct"] == pytest.approx((1.20 - 2.16) / 2.16)
+    assert -0.50 < rec["loss_pct"] < -0.40
+    # The dollar P/L field preserves the broker's actual value.
+    assert rec["unrealized_pnl"] == -96.0
+
+
+def test_profit_take_loss_pct_uses_unit_consistent_math():
+    """The profit-take path also fixed: an option with broker
+    unrealized_pl that's 100x off should still produce a sane
+    gain_pct, not a 100x-blown-up one."""
+    pos = {
+        "symbol": "AAPL260919C00200000",  # OCC option
+        "qty": 1,
+        "avg_entry_price": 2.00,
+        "current_price": 3.50,  # +$1.50/share, +75% gain
+        "unrealized_pl": 150.0,  # broker 100x off (but consistent sign)
+    }
+    out = pm.profit_take_positions([pos], pct=0.50)
+    assert len(out) == 1
+    rec = out[0]
+    assert rec["gain_pct"] == pytest.approx((3.50 - 2.00) / 2.00)
+    assert 0.70 < rec["gain_pct"] < 0.80
+    assert rec["unrealized_pnl"] == 150.0
+
+
+def test_get_blocked_symbols_uses_unit_consistent_loss_pct():
+    """The open-loss-block path also fixed: a -$1 per-share loss on
+    an option should still trip the -1% block, even when the broker's
+    ``unrealized_pl`` is the total-dollar value (which is 100x larger)."""
+    pos = {
+        "symbol": "NVDA260919C00100000",  # OCC option
+        "qty": 1,
+        "avg_entry_price": 5.00,
+        "current_price": 4.90,  # -2% per-share loss
+        "unrealized_pl": -10.0,  # broker says -$10 total
+    }
+    blocked = pm.get_blocked_symbols(
+        positions=[pos], conn=None,
+        cooldown_seconds=0, open_loss_block_pct=-0.01,
+    )
+    # NVDA is the underlying of the OCC symbol and should be blocked
+    # because the position is in -2% loss (past the -1% threshold).
+    assert "NVDA" in blocked
+
+
+def test_is_option_symbol_classification():
+    """OCC option symbols are detected by length and embedded digits.
+    Equities (1-5 uppercase letters) are NOT classified as options."""
+    assert pm._is_option_symbol("AAPL") is False
+    assert pm._is_option_symbol("SPY") is False
+    assert pm._is_option_symbol("GOOGL") is False
+    assert pm._is_option_symbol("COIN260911P00175000") is True
+    assert pm._is_option_symbol("SPY260304C00450000") is True
+    assert pm._is_option_symbol("AAPL260919C00200000") is True
+    # Edge case: 6+ letter equity-like tickers (rare) still classified
+    # as options, which is the safe default — the only consequence is
+    # an extra *100 in the dollar-P/L fallback, which is a no-op when
+    # the broker's field is present.
+    assert pm._is_option_symbol("abcdef") is True
+    # Empty / None.
+    assert pm._is_option_symbol("") is False
+    assert pm._is_option_symbol(None) is False
+
+
+# ---------------------------------------------------------------------------
 # MCP server wiring (execution node)
 # ---------------------------------------------------------------------------
 def test_execution_calls_mcp_get_positions(monkeypatch, tmp_path):
