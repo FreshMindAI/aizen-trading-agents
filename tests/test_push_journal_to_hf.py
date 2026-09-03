@@ -199,3 +199,129 @@ def test_resolve_token_does_not_echo_token(monkeypatch, caplog):
     # caplog.text is the union of all captured records; we never
     # want the token to leak through a logger.
     assert "hf_TESTTOKEN_DO_NOT_LOG_zzzzzzzzz" not in caplog.text
+
+
+# ---- 5. create_repo on first upload (404 fix) ------------------------
+
+def test_main_creates_dataset_repo_before_upload(tmp_path, monkeypatch):
+    """Regression: GH Actions cron runs were failing on the first push
+    with ``404 Not Found`` because the dataset repo did not exist.
+    ``push_journal_to_hf`` must call ``api.create_repo(exist_ok=True)``
+    BEFORE ``upload_file`` so the dataset materializes on first run
+    and is a no-op on every subsequent run. Mirrors the pattern in
+    ``scripts/deploy_to_hf.py:212``."""
+    # Fresh DB with a single decision row so the upload branch runs.
+    db = tmp_path / "trading.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript("""
+        CREATE TABLE decision_journal (
+            decision_id TEXT PRIMARY KEY,
+            timestamp   TEXT NOT NULL,
+            final_action TEXT NOT NULL DEFAULT 'NO_TRADE',
+            market_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            ml_prediction_json   TEXT NOT NULL DEFAULT '{}',
+            strategy_proposal_json TEXT NOT NULL DEFAULT 'null',
+            agent_observations_json TEXT NOT NULL DEFAULT '[]',
+            agent_messages_json     TEXT NOT NULL DEFAULT '[]'
+        );
+    """)
+    conn.execute(
+        "INSERT INTO decision_journal "
+        "(decision_id, timestamp, final_action) VALUES (?, ?, ?)",
+        ("d-100", "2026-09-03T15:00:00Z", "PROCEED"),
+    )
+    conn.commit()
+    conn.close()
+
+    state = tmp_path / "state.json"  # not present -> since=None
+    calls: list[tuple] = []
+
+    class _FakeApi:
+        def create_repo(self, **kwargs):
+            calls.append(("create_repo", kwargs))
+
+        def upload_file(self, **kwargs):
+            calls.append(("upload_file", kwargs))
+
+    class _FakeHfHub:
+        @staticmethod
+        def hf_hub_download(**kwargs):  # simulate missing remote
+            raise FileNotFoundError("snapshot.jsonl")
+
+    monkeypatch.setenv("HF_TOKEN", "hf_FAKE_FOR_TEST_xxxxxxxxxxxxxxx")
+    # The script imports HfApi + hf_hub_download at call time inside
+    # main() from the huggingface_hub package, so the module-level
+    # `push_journal_to_hf` module has no `HfApi` attribute to patch.
+    import huggingface_hub
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda token=None: _FakeApi())
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        _FakeHfHub.hf_hub_download)
+
+    rc = pjhf.main([
+        "--db", str(db),
+        "--state", str(state),
+        "--dataset", "TestUser/aizen-journal-test",
+    ])
+    assert rc == 0
+    # create_repo MUST come first, and MUST use exist_ok=True.
+    create_calls = [c for c in calls if c[0] == "create_repo"]
+    upload_calls = [c for c in calls if c[0] == "upload_file"]
+    assert len(create_calls) == 1, (
+        f"expected exactly one create_repo call, got {create_calls}"
+    )
+    assert create_calls[0][1]["repo_id"] == "TestUser/aizen-journal-test"
+    assert create_calls[0][1]["repo_type"] == "dataset"
+    assert create_calls[0][1]["exist_ok"] is True
+    assert len(upload_calls) == 1
+    # Order: create_repo runs BEFORE upload_file (the 404 fix).
+    create_idx = next(i for i, c in enumerate(calls) if c[0] == "create_repo")
+    upload_idx = next(i for i, c in enumerate(calls) if c[0] == "upload_file")
+    assert create_idx < upload_idx, (
+        f"create_repo must precede upload_file: {calls}"
+    )
+    assert state.exists()  # state file written so next run is a no-op
+
+
+def test_main_propagates_upload_file_404(tmp_path, monkeypatch):
+    """If the upload itself still 404s (e.g. write-protected existing
+    repo), the script must NOT swallow the error. Silent ignore would
+    hide a real auth issue from the operator."""
+    db = tmp_path / "trading.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript("""
+        CREATE TABLE decision_journal (
+            decision_id TEXT PRIMARY KEY,
+            timestamp   TEXT NOT NULL,
+            market_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            ml_prediction_json   TEXT NOT NULL DEFAULT '{}',
+            strategy_proposal_json TEXT NOT NULL DEFAULT 'null',
+            agent_observations_json TEXT NOT NULL DEFAULT '[]',
+            agent_messages_json     TEXT NOT NULL DEFAULT '[]'
+        );
+    """)
+    conn.execute(
+        "INSERT INTO decision_journal "
+        "(decision_id, timestamp) VALUES (?, ?)",
+        ("d-200", "2026-09-03T15:30:00Z"),
+    )
+    conn.commit()
+    conn.close()
+
+    class _FakeApi:
+        def create_repo(self, **kwargs):
+            return {"repo_id": kwargs["repo_id"]}
+
+        def upload_file(self, **kwargs):
+            raise RuntimeError("404 Client Error: Repository Not Found")
+
+    import huggingface_hub
+    monkeypatch.setenv("HF_TOKEN", "hf_FAKE_FOR_TEST_xxxxxxxxxxxxxxx")
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda token=None: _FakeApi())
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda **k: (_ for _ in ()).throw(FileNotFoundError()))
+
+    with pytest.raises(RuntimeError, match="404"):
+        pjhf.main([
+            "--db", str(db),
+            "--state", str(tmp_path / "state.json"),
+        ])

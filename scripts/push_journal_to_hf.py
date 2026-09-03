@@ -216,6 +216,36 @@ def main(argv: list[str] | None = None) -> int:
     token = _resolve_token()
     from huggingface_hub import HfApi
     api = HfApi(token=token)
+    # Ensure the dataset repo exists BEFORE the first upload. The
+    # GH Actions cron-loop runs ``push_journal_to_hf`` every 15 min
+    # on a fresh runner - if the dataset was never created on HF
+    # (a brand-new deployment, or the previous attempt was a 404),
+    # ``upload_file`` below would 404 with "Repository Not Found"
+    # and fail the workflow. ``create_repo(exist_ok=True)`` is the
+    # standard idempotent pattern: it creates the dataset on first
+    # run, returns silently on every subsequent run. Mirrors the
+    # call in ``scripts/deploy_to_hf.py:212`` for the model repo.
+    # The repo defaults to public (matches the model repo); flip to
+    # private by setting --private if the operator wants to.
+    private = bool(os.getenv("AIZEN_HF_DATASET_PRIVATE", "").lower()
+                   in ("1", "true", "yes"))
+    try:
+        api.create_repo(
+            repo_id=args.dataset,
+            repo_type="dataset",
+            private=private,
+            exist_ok=True,
+        )
+        logger.info(
+            "dataset repo ready: https://huggingface.co/datasets/%s%s",
+            args.dataset, " (private)" if private else "",
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Don't fail the whole script if the repo create is rejected
+        # (e.g. the user lacks write access on an existing repo);
+        # the upload_file below will surface the real error.
+        logger.warning("create_repo(%s) failed: %s: %s",
+                       args.dataset, type(exc).__name__, exc)
     # Commit each snapshot as a single file upload. The dataset is
     # a JSON Lines time-series: each upload overwrites the prior
     # ``snapshot.jsonl`` with the *merged* set. To avoid losing
