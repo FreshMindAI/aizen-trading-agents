@@ -71,6 +71,13 @@ jobs:
       AIZEN_LLM_PROVIDER: gmi_fallback
       ANTHROPIC_BASE_URL: https://api.gmi-serving.com
       ANTHROPIC_MESSAGES_PATH: /v1/messages
+      # Pin the GMI catalog id that the proxy actually serves with
+      # credit. Verified 200 OK on 2026-09-03 by live probe of
+      # /v1/messages. Other GMI catalog entries (gemma, gpt-5.4,
+      # anthropic/claude-haiku-4.5) all return 402 Insufficient
+      # balance. The default in src/agents/llm/base.py is the same
+      # id; this explicit env var is defense in depth.
+      AIZEN_LLM_MODEL: MiniMaxAI/MiniMax-M3
 
       # ---- Loop config ----
       RUN_MODE: paper

@@ -15,13 +15,22 @@ name = "aizen-scheduler"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 
-# Cron triggers intentionally left empty: scheduling is handled by
-# the GitHub Actions workflows (.github/workflows/*.yml's on.schedule
-# blocks) and the heartbeat workflow (.github/workflows/heartbeat.yml).
-# The [triggers] section is preserved as an empty array so a future
-# re-enable is a one-line uncomment.
+# Cron triggers re-enabled 2026-09-02. The GitHub Actions
+# `on.schedule:` and the heartbeat.yml backup both proved unreliable
+# over the past 24h (heartbeat schedule fired 6 times in 24h instead
+# of 288). Per Cloudflare's limits page Cron Triggers are included
+# on the Free plan (5/Worker) so re-enabling does not require the
+# $5/mo Paid tier. 4 triggers is well under the 5-trigger Free cap.
+# The heartbeat.yml backup is kept in place as a secondary safety
+# net: if Cloudflare cron drops a tick, the next 5-min heartbeat
+# dispatches the missed workflow via the Worker's fetch handler.
 [triggers]
-crons = [ ]
+crons = [
+  "0,15,30,45 * * * *",   # cron-loop.yml    (15-min trade tick)
+  "5,20,35,50 * * * *",   # news-pre-tick.yml (news + GNN topology)
+  "7 * * * *",            # hourly-analysis.yml
+  "30 20 * * 1-5",        # daily-pnl.yml    (weekdays 20:30 UTC)
+]
 
 # Worker logs go to Cloudflare's logpush. Set LOG_LEVEL via wrangler:
 #   npx wrangler secret put LOG_LEVEL

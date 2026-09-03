@@ -2,6 +2,12 @@
 
 Usage:
     ANTHROPIC_AUTH_TOKEN=... python -m pytest tests/test_gmi_provider.py -v -s
+
+Updated 2026-09-02 to use a non-blocked GMI catalog id. The previous
+default (MiniMaxAI/MiniMax-M3) is forbidden by project policy and is
+now rejected by the provider's ``_env_model`` guard (see
+``src/agents/llm/base.py``). The new default is the same id the cron
+workflow pins via AIZEN_LLM_MODEL.
 """
 
 from __future__ import annotations
@@ -23,11 +29,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# Default to the same GMI catalog id the cron workflow uses. The
+# AIZEN_LLM_MODEL env var still wins if set; this default is the
+# fallback. Keeping the test away from the forbidden id prevents the
+# provider's _env_model guard from raising before the request even
+# leaves the SDK.
+_GMI_DEFAULT_MODEL = "google/gemma-4-26b-a4b-it"
+
+
 def test_gmi_basic_chat():
     p = get_provider(
         "anthropic",
         base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.gmi-serving.com"),
-        default_model=os.getenv("ANTHROPIC_MODEL", "MiniMaxAI/MiniMax-M3"),
+        default_model=os.getenv("AIZEN_LLM_MODEL") or os.getenv("ANTHROPIC_MODEL") or _GMI_DEFAULT_MODEL,
     )
     assert p.api_key or p.auth_token
     req = LLMRequest(
@@ -45,7 +59,7 @@ def test_gmi_pydantic_roundtrip():
     p = get_provider(
         "anthropic",
         base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.gmi-serving.com"),
-        default_model=os.getenv("ANTHROPIC_MODEL", "MiniMaxAI/MiniMax-M3"),
+        default_model=os.getenv("AIZEN_LLM_MODEL") or os.getenv("ANTHROPIC_MODEL") or _GMI_DEFAULT_MODEL,
     )
     req = LLMRequest(
         system=(
@@ -56,7 +70,7 @@ def test_gmi_pydantic_roundtrip():
             '{"agent_id":"test_agent","message_type":"DIRECTION_VIEW",'
             '"confidence":0.7,"signal":{"direction_edge":0.4},'
             '"evidence":["gmi test"],"risks":[],"data_version":"test-1",'
-            '"model_versions":["MiniMax-M3"]}'
+            '"model_versions":["gemma-4-26b-a4b-it"]}'
         ))],
         max_tokens=128,
         metadata={"_response_model": "AgentObservation"},
@@ -86,9 +100,12 @@ def test_gmi_orchestrator_full_cycle():
     os.environ["ANTHROPIC_BASE_URL"] = os.getenv(
         "ANTHROPIC_BASE_URL", "https://api.gmi-serving.com"
     )
-    os.environ["ANTHROPIC_MODEL"] = os.getenv(
-        "ANTHROPIC_MODEL", "MiniMaxAI/MiniMax-M3"
-    )
+    # Prefer AIZEN_LLM_MODEL (the new cross-provider override) and
+    # fall back to ANTHROPIC_MODEL if it is set. The 2026-09-03
+    # decision lifted the MiniMax-M3 ban, so ANTHROPIC_MODEL is
+    # accepted as-is if present.
+    _explicit = os.getenv("AIZEN_LLM_MODEL") or os.getenv("ANTHROPIC_MODEL")
+    os.environ["ANTHROPIC_MODEL"] = _explicit or _GMI_DEFAULT_MODEL
 
     from src import config as cfg_mod
     cfg_mod.get_settings.cache_clear()

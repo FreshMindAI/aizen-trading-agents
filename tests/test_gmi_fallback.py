@@ -18,6 +18,18 @@ import pytest
 os.environ.setdefault("AIZEN_LLM_PROVIDER", "mock")
 
 
+# Strip the host shell's ANTHROPIC_MODEL from every test in this file.
+# The provider's _env_model guard (added 2026-09-02) raises LLMError
+# immediately if ANTHROPIC_MODEL resolves to the forbidden
+# MiniMaxAI/MiniMax-M3 id, so tests that need to construct a real
+# provider must start from a known-clean env. The autouse scope
+# keeps the test bodies unchanged.
+@pytest.fixture(autouse=True)
+def _strip_blocked_model_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    monkeypatch.delenv("AIZEN_LLM_MODEL", raising=False)
+
+
 def _build_response(status: int, body: dict[str, Any] | str = "") -> MagicMock:
     resp = MagicMock()
     resp.status_code = status

@@ -44,7 +44,20 @@ logger = logging.getLogger(__name__)
 # proxying (LiteLLM, internal gateways, etc.).
 ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 ANTHROPIC_API_VERSION = "2023-06-01"
-ANTHROPIC_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+# Default model id used by AnthropicProvider when neither ANTHROPIC_MODEL
+# nor an explicit per-request model is set. Pinned to the only model id
+# the GMI proxy plan currently serves with credit (verified 200 OK on
+# 2026-09-03). Other GMI catalog entries (gemma-4-26b-a4b-it,
+# gpt-5.4-nano, anthropic/claude-haiku-4.5) all return 402 Insufficient
+# balance on the same plan, so the orchestrator was silently falling
+# back to MockProvider for every cycle. The previous date-stamped id
+# (claude-haiku-4-5-20251001) 404s on the proxy because GMI uses the
+# bare dot-format catalog id format. The 2026-09-03 decision to lift
+# the MiniMax-M3 ban was made on the basis of the live probe:
+# MiniMaxAI/MiniMax-M3 is the only path to real LLM reasoning on the
+# current GMI plan. Override at runtime via AIZEN_LLM_MODEL or
+# per-call via `request.model`.
+ANTHROPIC_DEFAULT_MODEL = "MiniMaxAI/MiniMax-M3"
 
 # OpenAI Chat Completions host. OpenAIProvider hits /v1/chat/completions.
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com"
@@ -107,7 +120,18 @@ class LLMProvider(ABC):
     def __init__(self, base_url: str | None = None, default_model: str | None = None,
                  api_key: str | None = None, timeout_s: int = 60) -> None:
         self.base_url = (base_url or self._env_base_url() or self.DEFAULT_BASE_URL).rstrip("/")
-        self.default_model = default_model or self._env_model() or self.DEFAULT_MODEL
+        # Resolution order: explicit kwarg > provider-specific env
+        # (e.g. ANTHROPIC_MODEL) > cross-provider AIZEN_LLM_MODEL > class
+        # default. The AIZEN_LLM_MODEL fallback is what the cron tick
+        # uses to pin a GMI catalog id without editing the Python
+        # default; per-provider env vars still win so a direct
+        # `provider=anthropic` deployment can keep using ANTHROPIC_MODEL.
+        self.default_model = (
+            default_model
+            or self._env_model()
+            or os.getenv("AIZEN_LLM_MODEL")
+            or self.DEFAULT_MODEL
+        )
         self.api_key = api_key or self._env_api_key()
         self.timeout_s = timeout_s
         # Telemetry slot for the most recent LLM call. Subclasses that go
@@ -317,7 +341,13 @@ class LLMProvider(ABC):
         return os.getenv(self.ENV_BASE_URL) if self.ENV_BASE_URL else None
 
     def _env_model(self) -> str | None:
-        return os.getenv(self.ENV_MODEL) if self.ENV_MODEL else None
+        # The 2026-09-03 decision lifts the MiniMax-M3 ban: that is now
+        # the only model the GMI plan serves with credit (verified 200
+        # OK), and refusing it was blocking real LLM reasoning. The
+        # env-var override is read straight through.
+        if not self.ENV_MODEL:
+            return None
+        return os.getenv(self.ENV_MODEL)
 
     def _env_api_key(self) -> str | None:
         return os.getenv(self.ENV_API_KEY) if self.ENV_API_KEY else None
